@@ -55,6 +55,7 @@ local function try_run(phase, callback)
 end
 
 local battery_mirror_initialized = false
+local sound_alert_sent = false
 
 while true do
 	local suit_transmitter_ref
@@ -72,12 +73,18 @@ while true do
 		end
 
 		if suit_transmitter_ref ~= nil and simulation_memory_ref ~= nil then
-			-- local seconds_remaining = ic.read_id(weather_station_ref, LT.NextWeatherEventTime)
-			local seconds_remaining = ic.read_id(simulation_memory_ref, LT.Setting)
+			local seconds_remaining = ic.read_id(weather_station_ref, LT.NextWeatherEventTime)
+			-- local seconds_remaining = ic.read_id(simulation_memory_ref, LT.Setting)
 			local has_storm_time = seconds_remaining ~= nil and seconds_remaining ~= 0
 
-			if SOUND_ALERT ~= nil then
+			if not has_storm_time then
+				sound_alert_sent = false
+			elseif SOUND_ALERT ~= nil and not sound_alert_sent then
 				ic.write_id(suit_transmitter_ref, SOUND_ALERT, has_storm_time and 1 or 0)
+				sound_alert_sent = true
+				ic.timer.in_seconds(10, function()
+					ic.write_id(suit_transmitter_ref, SOUND_ALERT, 0)
+				end)
 			end
 
             yield()

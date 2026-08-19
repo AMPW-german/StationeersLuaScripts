@@ -31,10 +31,12 @@ local LENS_RGB = {
     yellow = { 234, 179, 8 },
 }
 
-local function safeReadId(ref, logicType)
+local function safeReadId(ref, logicType, quiet)
     local ok, valueOrError = pcall(ic.read_id, ref, logicType)
     if not ok then
-        print(string.format("[Visor] read_id failed for ref %s, logic %s: %s", tostring(ref), tostring(logicType), tostring(valueOrError)))
+        if not quiet then
+            print(string.format("[Visor] read_id failed for ref %s, logic %s: %s", tostring(ref), tostring(logicType), tostring(valueOrError)))
+        end
         return nil
     end
 
@@ -60,9 +62,9 @@ local function findSuitRef()
     for _, device in ipairs(devices) do
         local ref = math.floor(tonumber(device.ref_id) or 0)
         if ref ~= 0
-            and safeReadId(ref, LT.Filtration) ~= nil
-            and safeReadId(ref, LT.RatioOxygen) ~= nil
-            and safeReadId(ref, LT.Pressure) ~= nil then
+            and safeReadId(ref, LT.Filtration, true) ~= nil
+            and safeReadId(ref, LT.RatioOxygen, true) ~= nil
+            and safeReadId(ref, LT.Pressure, true) ~= nil then
             return ref
         end
     end
@@ -232,7 +234,7 @@ local function paintNavigationArrow(canvasId, bearing, lensColor)
     local red, green, blue = lensRgb(lensColor)
     local center = NAV_SIZE / 2
     local radius = 17
-    local angle = math.rad((bearing or 0) + 90)
+    local angle = math.rad(((-bearing or 0) - 90) % 360)
     local pointX = center + math.sin(angle) * radius
     local pointY = center - math.cos(angle) * radius
 
@@ -307,7 +309,7 @@ buildHud = function()
         hud:element({
             id = "waypoint_name_" .. tostring(index),
             type = "textinput",
-            rect = { unit = "px", x = statusX, y = rowY, w = navigationTextWidth - 46, h = 20 },
+            rect = { unit = "px", x = statusX - 8, y = rowY, w = navigationTextWidth - 24, h = 24 },
             props = { value = waypointName, placeholder = "WAYPOINT " .. tostring(index), visible = true },
             style = { bg = "#00000000", text = lensColor, placeholder_color = lensColor, font_size = 15 },
             on_change = function(value)
