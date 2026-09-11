@@ -234,7 +234,7 @@ local function paintNavigationArrow(canvasId, bearing, lensColor)
     local red, green, blue = lensRgb(lensColor)
     local center = NAV_SIZE / 2
     local radius = 17
-    local angle = math.rad(((-bearing or 0) - 90) % 360)
+    local angle = math.rad((-(bearing or 0) - 90) % 360)
     local pointX = center + math.sin(angle) * radius
     local pointY = center - math.cos(angle) * radius
 
@@ -255,6 +255,7 @@ buildHud = function()
     local statusY = 16
     local statusX = math.max(0, width - statusWidth - rightEdgeOffset)
     local suitRef = findSuitRef()
+    local hardsuitAvailable = suitRef ~= nil
     local stormSetting = suitRef and safeReadId(suitRef, LT.Setting) or nil
     local pressureSetting = suitRef and safeReadId(suitRef, LT.PressureSetting) or nil
     local stormSeconds = stormSetting and math.floor(math.abs(stormSetting)) or 0
@@ -375,6 +376,13 @@ buildHud = function()
         rect = { unit = "px", x = 0, y = height / 2 - 18, w = width, h = 36 },
         props = { text = "STORM INCOMING", visible = timerVisible and stormSeconds <= 30 },
         style = { font_size = 28, color = "#EF4444", align = "center" },
+    })
+    hud:element({
+        id = "hardsuit_unavailable",
+        type = "label",
+        rect = { unit = "px", x = statusX, y = statusY + 28, w = statusWidth, h = 20 },
+        props = { text = "HARDSUIT NOT AVAILABLE", visible = not hardsuitAvailable },
+        style = { font_size = 14, color = "#EF4444", align = "right" },
     })
     hud:commit()
     paintNavigationArrow(NAV_CANVAS_ID, navigation and navigation.relativeBearing, lensColor)
