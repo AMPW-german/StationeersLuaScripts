@@ -4,22 +4,23 @@
 
 Build one StationeersLua controller chip that discovers, validates, recovers, and operates an SDB silo storage system. Other Lua chips use a versioned network API to request resources and read controller state. A console chip may later use the same API for display and configuration.
 
-This document is an implementation plan. No storage controller exists in this repository yet.
+This document records the implementation plan and its current state. `StorageController.lua` and the manual request client now exist in this repository.
 
 ## Current State
 
 ### Repository
 
-- The repository contains independent StationeersLua automation scripts and no existing storage controller, shared storage module, test harness, or console client.
-- Existing scripts use local enum aliases, `ic.device.list()` or `ic.find*()` discovery, direct `ic.read_id`/`ic.write_id` access, explicit startup validation, `yield()`-based loops, and `pcall()` around operations that may fail.
-- The controller should initially be one Lua script. A separate console script is outside the first implementation but its API contract is included below.
+- `StorageController.lua` is a single controller script. It implements topology enumeration, safe initialization, sorter-memory recovery, a startup inventory baseline, input and fail-valve servicing, ledger reservations, persistence, state publications, and the version-1 request/status/cancel/state/config RPC surface.
+- `StorageControllerRequestTest.lua` is the sole test client. It uses two named button/dial pairs to request iron and silicon ingots through the controller API.
+- Physical output fulfillment is implemented as a serialized controller task. It dispenses one source stack at a time, accounts at the closed output-input valve, splits and releases exact requested portions through output 1, and sends excess material through output 2 to normal input accounting. Recovery drains and decoded post-ready silo reconciliation remain unimplemented because Stationpedia does not expose the SDB internal-memory encoding.
+- The storage topology is currently empty and not in use. No fixture, automated Lua harness, or further test script is planned at this stage.
 
 ### Verified Stationeers capabilities
 
 - `StructureLogicSorter` (`873418029`) has 32 writable 64-bit memory rows, modes All/Any/None, and Import, reject Export, and matching Export 2 slots.
 - A prefab-equality sorter row is encoded as opcode `FilterPrefabHashEquals` in bits 0-7 and the signed 32-bit prefab hash in bits 8-39. Unused rows must be zero.
 - `StructureStacker` (`-2020231820`) and `StructureStackerReverse` (`1585641623`) expose Automatic/Logic mode, `Setting`, one-shot `Output`, and three readable slots.
-- `StructureSDBSilo` (`1155865682`) holds up to 600 stacks. It exposes `Quantity`, `Dispense`, `DispenseSlot`, two transfer slots, and read-only internal memory reported as 4800 bytes by Stationpedia.
+- `StructureSDBSilo` (`1155865682`) holds up to 600 stacks. It exposes `Quantity`, `StackSize`, `Dispense`, `DispenseSlot`, two transfer slots, and read-only internal memory reported as 4800 bytes by Stationpedia. `StackSize` reports the silo capacity of 600 rather than an item's physical stack size. Each occupied memory word stores an 8-bit opcode, a 13-bit stack quantity at bits 8-20, and an unsigned prefab hash at bits 21-52. A current game bug reports ingot quantity as 1, which the controller temporarily overrides to 500.
 - Left and right chute digital valves expose `On`, `Open`, `Setting`, `Quantity`, and one transport slot. They can close after a configured number of items.
 - Left and right chute digital flip-flop splitters expose `On`, `Mode`, `Setting`, `SettingOutput`, `Quantity`, and one transport slot.
 - StationeersLua supports device enumeration, reference-ID reads/writes, slot reads, external device memory reads/writes, persistence, cooperative `yield()`, RPC, and pub/sub on the same data network.
@@ -188,9 +189,9 @@ Unsupported writes, failed read-backs, or a device `Error` value put the control
 
 ### Resumable inventory reconciliation
 
-- Before `ready`, obtain the cheap quantity baseline for each assigned group: read the silo's occupied-slot count from `Quantity`, read the item quantity of any occupied internal stack, multiply the two values, and add any quantity waiting in the group stacker. Since `Setting = 500` exceeds supported item stack limits, every silo stack should be full and have the same resource-specific quantity.
-- Treat an empty silo as zero without requesting a stored stack. If its group stacker holds a partial item, read that item's quantity and `MaxQuantity`; if both are empty, inventory is zero and `max_stack_quantity` may remain unknown until new input arrives. For a nonempty silo, record the sampled full-stack quantity as `max_stack_quantity` and, where the API exposes it, compare it with the item's `MaxQuantity`. If the sample is nonpositive, differs from a known `MaxQuantity`, or later sampled stacks disagree, the cheap baseline is unsafe: record a validation mismatch, use an exact incremental count during reconciliation, and do not accept output requests against that group until its quantity is known.
-- After the controller enters `ready`, scan the silo's read-only internal memory incrementally. Check at most `MAX_SILO_CHECKS_PER_TICK` stacks per idle tick, defaulting to one; the implementation probe must establish the address range and value encoding.
+- Before `ready`, obtain a cheap quantity baseline for each assigned group: read the silo's occupied-stack count from `Quantity`, immediately decode memory address 0 when the silo is nonempty, verify its signed prefab hash against the sorter assignment, and multiply the decoded stack quantity by the occupied-stack count. Log and replace a decoded quantity of 1 with 500 as a temporary workaround for the ingot-memory bug.
+- Treat an empty silo as zero without reading an internal stack. If no stack size was learned from the group stacker, retry the single address-0 sample when a request arrives; return `inventory_unknown` without blocking when the silo is still empty or the sample is unavailable.
+- After the controller enters `ready`, scan the occupied silo memory incrementally. Check at most `MAX_SILO_MEMORY_READS_PER_TICK` stacks per idle tick, defaulting to one, and stop at the occupied-stack count captured for the recovery baseline.
 - Run a scan step only when the recovery, output, and fixed per-tick valve services have no pending work. Store the cursor and resume without restarting already verified addresses.
 - Compare every nonempty stored stack with the recovered sorter assignment and verify its quantity equals the group's resource-specific `max_stack_quantity`. Include the group stacker's current partial item separately; do not rely on transient sorter or silo transfer slots.
 - If an assigned group contains another prefab, or an unassigned group is not empty, mark it `mismatch` and enqueue a priority-1 recovery drain.
@@ -238,7 +239,7 @@ Additional scheduling rules:
 ### Physical fulfillment
 
 - Acquire the shared silo-output lock and revalidate the reservation against the ledger.
-- Partition the request as `full_output_count = floor(requested_quantity / max_stack_quantity)` plus `final_quantity = requested_quantity % max_stack_quantity`. Keep `Storage.OutputStacker.Setting = 500` while emitting `full_output_count` resource-limited full stacks, then set it to `final_quantity` only when a smaller final stack is required. A request may therefore deliver several full stacks and one final partial stack.
+- Calculate `source_stack_count = ceil(requested_quantity / max_stack_quantity)`. Dispense those source stacks one at a time through the cooperative output state machine, checking the silo's current `Quantity` before each command. This keeps the controller responsive to other per-tick services and limits excess material to less than one source stack.
 - Dispense enough resource-specific full stacks from the silo to cover each output portion. If the silo alone cannot cover the request, command the group's input stacker, whose setting remains 500, to export its pending resource into the silo, then dispense it as part of the same serialized request.
 - If exporting the group stacker and dispensing the silo empties the group, clear its sorter assignment before returned remainders can reach input. This lets the returned resource claim a free group through normal input assignment.
 - Select the required silo stack(s) using the verified `DispenseSlot`/`Dispense` sequence.
@@ -340,7 +341,7 @@ RPC responses are authoritative; pub/sub is notification and cache-refresh signa
 
 Run these against a small isolated test line before enabling normal operation:
 
-- Determine the exact SDB silo internal-memory address range and value encoding for prefab hash and stack quantity; verify empty, one-stack, mixed-stack, and 600-slot boundary cases.
+- Verify the documented SDB silo memory decoder against empty, one-stack, mixed-stack, and 600-slot boundary cases.
 - Verify that silo `Quantity` is occupied-stack count and that reading any occupied internal stack yields the resource's own `MaxQuantity` after the group stacker has normalized input. Test resources with several different maximum stack sizes and verify `slot_count * sampled_stack_quantity` against an exact scan.
 - Verify `Dispense`, `DispenseSlot`, `Open`, `Activate`, and mode idle/one-shot behavior.
 - Verify stacker Automatic mode with `Setting = 500` for resources whose `MaxQuantity` values are lower than 500; each emitted silo stack must equal the item's maximum rather than 500.
@@ -355,48 +356,24 @@ Record calibrated values as named constants near the top of the script. A failed
 
 ## Verification Strategy
 
-### Pure logic tests
+The only planned test is `StorageControllerRequestTest.lua`. It requires one Lua chip on the controller's data network, with the following device labels:
 
-- Hex label parsing, canonicalization, contiguous ID validation, duplicate/orphan detection, and reserved-name exclusion.
-- Signed 32-bit sorter row encode/decode and invalid-memory detection.
-- Group assignment uniqueness and lowest-free-group selection.
-- Resource-specific maximum-stack discovery, baseline multiplication, and request partitioning into full and final partial output portions.
-- Priority/FIFO output queue ordering, resumable post-ready scan cursor, and per-tick scan limit.
-- Reservation arithmetic, idempotent request replay, cancellation, and request state transitions.
-- Persistence schema validation and recovery from incomplete output checkpoints.
+- `Storage.Test.IronButton` and `Storage.Test.IronDial`
+- `Storage.Test.SiliconButton` and `Storage.Test.SiliconDial`
 
-If no Lua unit-test harness is introduced, keep these functions free of device access and run a temporary self-test mode on a spare chip before hardware integration.
+Each rising button press submits `storage.request` to `Storage.Controller` for the corresponding ingot. The requested quantity is the nearest integer represented by its dial's `Setting`; zero and negative quantities are ignored. The client prints the accepted request ID/state or the stable rejection code returned by the controller.
 
-### Hardware integration tests
-
-- Correct topology reaches recovery; a single enumeration plus sequential validation detects every missing, duplicate, malformed, nonsequential, orphaned, and extra managed device with all valves closed.
-- Incorrect manual settings are rewritten and read back on startup.
-- Valid sorter assignments survive restart; malformed programs do not.
-- Empty group assignment routes the first new prefab correctly; later stacks reuse that group.
-- Full/no-free storage sends terminal rejects to dump without opening a wrong group.
-- Startup mismatch drains to return, re-enters input, and ends with a clean reassignment.
-- Post-ready slot scan runs at no more than the configured checks per idle tick, pauses whenever other work exists, and resumes at the same cursor.
-- Two clients requesting the same stock cannot over-reserve it.
-- Duplicate client request IDs do not duplicate movement.
-- Insufficient requests reject before dispense with zero delivered.
-- Exact quantities smaller than, equal to, and larger than a resource-specific maximum stack complete as the expected sequence of full output stacks plus one optional final partial stack, with only unrequested remainder returned to input.
-- Requests that require the pending group-stacker resource export it, clear an emptied group's sorter assignment, and count returned remainder exactly once at the input valve.
-- Items held at every valve remain observable across delayed ticks; no test depends on catching a transient non-valve slot.
-- Save/load and housing power-cycle tests at every persisted movement checkpoint either resume safely or fault closed without duplicate delivery.
-- Jam, power loss, missing device, and changed label tests close flow and expose actionable faults.
+The silo system is empty and currently unused. Until output hardware calibration is recorded, each valid press is expected to receive `capability_not_calibrated`; after calibration and stocking, it should receive `unknown_resource`, `insufficient_stock`, or a queued request according to controller state. No automated tests, fixture topology, or additional manual test scripts will be added.
 
 ## Implementation Steps
 
-- [ ] Create `StorageController.lua` with constants, enum aliases, safe device access wrappers, and phase/error reporting; verify it boots with all managed valves closed.
-- [ ] Implement single-pass device enumeration and sequential group validation; verify all malformed, duplicate, missing, extra, orphaned, and nonsequential fixtures produce aggregated errors.
-- [ ] Add mandatory device configuration and read-back checks; verify manually altered settings are corrected after restart.
-- [ ] Implement sorter row packing, decoding, validation, and assignment indexing; verify positive/negative prefab hashes round-trip and physical test items route correctly.
-- [ ] Run and document the required silo, per-resource maximum-stack, stacker, valve, splitter-control, and counter probes; verify fixed output-2 routing and keep output disabled until every output-dependent behavior passes.
-- [ ] Implement versioned persistence and output checkpoints; verify restart at each synthetic checkpoint preserves reservations without duplicate completion.
-- [ ] Implement the output/recovery scheduler plus post-ready bounded scan; verify scanning runs only when idle, checks at most the configured count, and resumes at its prior cursor.
+- [x] Create `StorageController.lua` with constants, enum aliases, safe device access wrappers, phase/error reporting, single-pass discovery, mandatory device configuration, and sorter-memory assignment recovery.
+- [x] Implement input/fail-valve servicing, lowest-free assignment, in-memory ledger accounting, versioned persistence, request reservation, and the read-only RPC surface.
+- [x] Add `StorageControllerRequestTest.lua` with iron and silicon button/dial controls as the sole planned test client.
+- [ ] Run and document the required silo, per-resource maximum-stack, stacker, valve, splitter-control, and counter probes; verify fixed output-2 routing and confirm the documented output control sequence in-game.
+- [x] Implement serialized output checkpoints at the closed output-input and output valves, with exact-quantity validation, valve timeouts, journal persistence, and fault-safe closure.
+- [x] Implement the output scheduler plus post-ready bounded raw-memory scan; scanning runs only when output work is idle, checks at most the configured count, and resumes at its prior cursor.
 - [ ] Implement incremental post-ready reconciliation and mismatch drain/return; verify every scanned stack matches assignment and quantity or the group is emptied and reassigned.
-- [ ] Implement fixed per-tick input and fail-valve services, lowest-ID assignment, retry, dump, and accounting; verify held items survive delayed checks and retries are counted exactly once.
-- [ ] Implement reservation and asynchronous request state logic without hardware movement; verify atomic rejection, idempotency, cancellation, FIFO ordering, and queue limits.
 - [ ] Implement serialized physical output with resource-specific full portions and a smaller final portion, pending group-stacker export, assignment clearing, and output-2 remainder return; verify exact quantities across stack boundaries and all valve safe-state postconditions.
 - [ ] Register RPC methods and pub/sub events; verify API version errors, pagination, state revisions, destination-ID round-trip, ownership checks, and payload bounds.
 - [ ] Add concise operational logging and fault snapshots; verify every injected device error identifies the device, closes flow, and remains queryable.
