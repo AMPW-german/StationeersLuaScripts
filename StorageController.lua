@@ -10,7 +10,9 @@ local SORTER_ROWS = 32
 local MAX_QUEUE_LENGTH = 64
 local MAX_REQUEST_HISTORY = 128
 local VALVE_TIMEOUT_TICKS = 120
+local DRAIN_EMPTY_CONFIRM_TICKS = 2
 local MAX_DISCOVERY_ATTEMPTS = 20
+local DISCOVERY_STABLE_SCANS = 3
 local SILO_MEMORY_WORDS = 600
 local MAX_SILO_MEMORY_READS_PER_TICK = 1
 
@@ -186,6 +188,9 @@ local function fault(code, detail)
     for _, splitter in pairs(state.splitters) do
         safe_write(splitter.ref_id, LT.Mode, 0)
     end
+    for _, group in pairs(state.groups) do
+        safe_write(group.silo.ref_id, LT.Open, 0)
+    end
     persist()
     publish("storage/v1/fault", state.fault)
     publish_state()
@@ -314,6 +319,26 @@ local function discover_topology()
     return true
 end
 
+local function topology_signature()
+    local parts = {
+        tostring(state.group_count),
+        tostring(state.valves.input.ref_id),
+        tostring(state.valves.fail.ref_id),
+        tostring(state.valves.output_in.ref_id),
+        tostring(state.valves.output_out.ref_id),
+        tostring(state.splitters.fail.ref_id),
+        tostring(state.splitters.output.ref_id),
+        tostring(state.output_stacker.ref_id),
+    }
+    for id = 0, state.group_count - 1 do
+        local group = state.groups[id]
+        parts[#parts + 1] = tostring(group.sorter.ref_id)
+        parts[#parts + 1] = tostring(group.stacker.ref_id)
+        parts[#parts + 1] = tostring(group.silo.ref_id)
+    end
+    return table.concat(parts, ":")
+end
+
 local function configure(ref_id, logic_type, value, name)
     local ok, err = safe_write(ref_id, logic_type, value)
     if not ok then
@@ -341,6 +366,7 @@ local function configure_devices()
         configure(group.stacker.ref_id, LT.Mode, 0, group.label)
         configure(group.stacker.ref_id, LT.Setting, GROUP_STACKER_SETTING, group.label)
         configure(group.silo.ref_id, LT.On, 1, group.label)
+        configure(group.silo.ref_id, LT.Open, 0, group.label)
     end
     configure(state.output_stacker.ref_id, LT.On, 1, NAME_OUTPUT_STACKER)
     configure(state.output_stacker.ref_id, LT.Mode, 1, NAME_OUTPUT_STACKER)
@@ -463,6 +489,27 @@ local function set_assignment(group, prefab_hash)
     return true
 end
 
+local function clear_assignment(group, next_state)
+    local prefab_hash = group.assignment_prefab_hash
+    group.state = next_state or "unassigned"
+    for address = 0, SORTER_ROWS - 1 do
+        local ok, err = safe_memory_write(group.sorter.ref_id, address, 0)
+        if not ok then
+            return false, "sorter memory clear failed: " .. tostring(err)
+        end
+        if safe_memory_read(group.sorter.ref_id, address) ~= 0 then
+            return false, "sorter memory clear read-back mismatch"
+        end
+    end
+    if prefab_hash and state.prefab_groups[prefab_hash] == group then
+        state.prefab_groups[prefab_hash] = nil
+    end
+    group.assignment_prefab_hash = nil
+    group.assignment_source = nil
+    print("StorageController: cleared assignment for " .. group.label)
+    return true
+end
+
 local function recover_assignments()
     for _, group in pairs(state.groups) do
         local row0 = safe_memory_read(group.sorter.ref_id, 0)
@@ -515,9 +562,22 @@ local function read_item(ref_id, slot)
     return { prefab_hash = prefab_hash, quantity = quantity, max_quantity = max_quantity }
 end
 
+local function read_stacker_item(ref_id)
+    for slot = 0, 2 do
+        local item, item_error = read_item(ref_id, slot)
+        if item_error then
+            return nil, item_error
+        end
+        if item then
+            return item
+        end
+    end
+    return nil
+end
+
 local function baseline_inventory()
     for _, group in pairs(state.groups) do
-        local stacker_item, stacker_error = read_item(group.stacker.ref_id)
+        local stacker_item, stacker_error = read_stacker_item(group.stacker.ref_id)
         if stacker_error then
             add_error("inventory_baseline_failed", group.label .. ": " .. stacker_error)
         end
@@ -638,18 +698,29 @@ local function release_valve(valve, splitter, route_one)
     end
     if splitter then
         local mode = route_one and 0 or 1
-        if not configure(splitter.ref_id, LT.Mode, mode, splitter.display_name) then
-            fault("device_error", splitter.display_name)
-            return
+        if valve.route_mode ~= mode then
+            valve.route_mode = mode
+            valve.route_tick = now()
         end
+        local written = safe_write(splitter.ref_id, LT.Mode, mode)
+        local observed = safe_read(splitter.ref_id, LT.Mode)
+        if not written or observed ~= mode then
+            if now() - valve.route_tick > VALVE_TIMEOUT_TICKS then
+                fault("device_error", splitter.display_name .. " route did not confirm; observed " .. tostring(observed))
+            end
+            return false
+        end
+        valve.route_mode = nil
+        valve.route_tick = nil
     end
     if not safe_write(valve.ref_id, LT.Open, 1) then
         fault("device_error", valve.display_name)
-        return
+        return false
     end
     valve.releasing = true
     valve.release_tick = now()
     print("StorageController: released " .. valve.display_name)
+    return true
 end
 
 local function service_input()
@@ -733,6 +804,18 @@ local function fail_output_task(task, code, detail)
     fault(code, detail)
 end
 
+local function reject_output_task(task, code, detail)
+    local request = task.request
+    task.group.reserved_quantity = math.max(0, task.group.reserved_quantity - request.reserved_quantity)
+    task.group.confirmed_quantity = 0
+    state.inventory_revision = state.inventory_revision + 1
+    transition(request, "rejected", code)
+    state.active_request_id = nil
+    state.output_task = nil
+    persist()
+    print("StorageController: rejected request " .. request.request_id .. ": " .. detail)
+end
+
 local function start_output_task()
     while #state.queue > 0 do
         local request_id = table.remove(state.queue, 1)
@@ -740,7 +823,10 @@ local function start_output_task()
         if request and request.state == "queued" then
             local group = state.groups[request.group_id]
             if not group or group.assignment_prefab_hash ~= request.prefab_hash or not group.max_stack_quantity or group.max_stack_quantity <= 0 then
-                transition(request, "faulted", "inventory_mismatch")
+                if group then
+                    group.reserved_quantity = math.max(0, group.reserved_quantity - request.reserved_quantity)
+                end
+                transition(request, "rejected", "inventory_changed")
                 persist()
             else
                 transition(request, "active")
@@ -749,7 +835,6 @@ local function start_output_task()
                     request = request,
                     group = group,
                     remaining_quantity = request.requested_quantity,
-                    remaining_source_stacks = math.ceil(request.requested_quantity / group.max_stack_quantity),
                     buffered_quantity = 0,
                     stage = "dispense",
                     stage_tick = now(),
@@ -770,9 +855,70 @@ local function command_stacker_output(quantity)
     return safe_write(state.output_stacker.ref_id, LT.Output, 1)
 end
 
+local function start_group_drain(task, stacker_item)
+    if not clear_assignment(task.group, "draining") then
+        return false, "sorter assignment"
+    end
+    task.draining_group = true
+    task.drain_empty_ticks = 0
+    task.drain_source_observed = false
+    task.group.pending_quantity = stacker_item.quantity
+    if not safe_write(task.group.silo.ref_id, LT.Open, 1) then
+        return false, "silo open"
+    end
+    if not safe_write(task.group.stacker.ref_id, LT.Activate, 1) then
+        return false, "stacker activate"
+    end
+    print("StorageController: activated partial-stack drain for " .. task.group.label)
+    return true
+end
+
+local function service_group_drain(task)
+    if not task.draining_group or not task.drain_source_observed then
+        return true
+    end
+    local stacker_item, stacker_error = read_stacker_item(task.group.stacker.ref_id)
+    if stacker_error then
+        return false, "stacker: " .. stacker_error
+    end
+    local silo_stacks, quantity_error = safe_read(task.group.silo.ref_id, LT.Quantity)
+    if type(silo_stacks) ~= "number" then
+        return false, "silo quantity: " .. tostring(quantity_error)
+    end
+    if stacker_item or silo_stacks > 0 then
+        task.drain_empty_ticks = 0
+        return true
+    end
+    task.drain_empty_ticks = task.drain_empty_ticks + 1
+    if task.drain_empty_ticks < DRAIN_EMPTY_CONFIRM_TICKS then
+        return true
+    end
+    for _, request_id in ipairs(state.queue) do
+        local queued_request = state.requests[request_id]
+        if queued_request and queued_request.state == "queued" and queued_request.group_id == task.group.id then
+            task.group.reserved_quantity = math.max(0, task.group.reserved_quantity - queued_request.reserved_quantity)
+            transition(queued_request, "rejected", "inventory_changed")
+        end
+    end
+    task.group.reserved_quantity = math.max(0, task.group.reserved_quantity - task.request.reserved_quantity)
+    task.reservation_released = true
+    task.group.state = "unassigned"
+    task.group.pending_quantity = 0
+    task.group.max_stack_quantity = nil
+    task.group.silo_stack_count = 0
+    task.group.silo_memory_cursor = 0
+    task.group.silo_memory_words = {}
+    task.group.scan_complete = true
+    task.draining_group = false
+    print("StorageController: released empty group " .. task.group.label)
+    return true
+end
+
 local function complete_output_task(task)
     local request = task.request
-    task.group.reserved_quantity = math.max(0, task.group.reserved_quantity - request.reserved_quantity)
+    if not task.reservation_released then
+        task.group.reserved_quantity = math.max(0, task.group.reserved_quantity - request.reserved_quantity)
+    end
     request.delivered_quantity = request.requested_quantity
     transition(request, "completed")
     state.active_request_id = nil
@@ -786,12 +932,21 @@ local function service_output()
         return
     end
     if now() - task.stage_tick > VALVE_TIMEOUT_TICKS then
-        fail_output_task(task, "movement_timeout", "output stage " .. task.stage)
+        if task.stage == "await_source" and task.remaining_quantity == task.request.requested_quantity and task.buffered_quantity == 0 then
+            reject_output_task(task, "insufficient_stock", task.group.label .. " did not provide the reserved material")
+        else
+            fail_output_task(task, "movement_timeout", "output stage " .. task.stage)
+        end
         return
     end
 
     local input_valve = state.valves.output_in
     local output_valve = state.valves.output_out
+    local drain_ok, drain_error = service_group_drain(task)
+    if not drain_ok then
+        fail_output_task(task, "device_error", task.group.label .. " drain: " .. drain_error)
+        return
+    end
     if task.stage == "dispense" then
         if task.buffered_quantity > 0 then
             task.portion_quantity = math.min(task.remaining_quantity, task.buffered_quantity)
@@ -802,24 +957,66 @@ local function service_output()
             set_output_stage(task, "await_output")
             return
         end
-        if task.remaining_source_stacks <= 0 then
-            fail_output_task(task, "inventory_mismatch", task.group.label .. " did not provide enough material")
-            return
-        end
         local available_stacks, quantity_error = safe_read(task.group.silo.ref_id, LT.Quantity)
         if type(available_stacks) ~= "number" then
             fail_output_task(task, "device_error", task.group.label .. " quantity: " .. tostring(quantity_error))
             return
         end
         if available_stacks <= 0 then
-            fail_output_task(task, "inventory_mismatch", task.group.label .. " has no silo stacks available")
+            local stacker_item, stacker_error = read_stacker_item(task.group.stacker.ref_id)
+            if stacker_error then
+                fail_output_task(task, "device_error", task.group.label .. " stacker: " .. stacker_error)
+                return
+            end
+            if not stacker_item then
+                set_output_stage(task, "await_source")
+                return
+            end
+            if stacker_item.prefab_hash ~= task.request.prefab_hash then
+                fail_output_task(task, "inventory_mismatch", task.group.label .. " stacker contains wrong prefab")
+                return
+            end
+            local started, start_error = start_group_drain(task, stacker_item)
+            if not started then
+                fail_output_task(task, "device_error", task.group.label .. " drain: " .. start_error)
+                return
+            end
+            set_output_stage(task, "await_input")
             return
         end
-        if not safe_write(task.group.silo.ref_id, LT.Dispense, 1) then
-            fail_output_task(task, "device_error", task.group.label .. " dispense")
+        if not safe_write(task.group.silo.ref_id, LT.Open, 1) then
+            fail_output_task(task, "device_error", task.group.label .. " open")
             return
         end
         set_output_stage(task, "await_input")
+        return
+    end
+
+    if task.stage == "await_source" then
+        local available_stacks, quantity_error = safe_read(task.group.silo.ref_id, LT.Quantity)
+        if type(available_stacks) ~= "number" then
+            fail_output_task(task, "device_error", task.group.label .. " quantity: " .. tostring(quantity_error))
+            return
+        end
+        if available_stacks > 0 then
+            set_output_stage(task, "dispense")
+            return
+        end
+        local stacker_item, stacker_error = read_stacker_item(task.group.stacker.ref_id)
+        if stacker_error then
+            fail_output_task(task, "device_error", task.group.label .. " stacker: " .. stacker_error)
+        elseif stacker_item then
+            if stacker_item.prefab_hash ~= task.request.prefab_hash then
+                fail_output_task(task, "inventory_mismatch", task.group.label .. " stacker contains wrong prefab")
+                return
+            end
+            local started, start_error = start_group_drain(task, stacker_item)
+            if not started then
+                fail_output_task(task, "device_error", task.group.label .. " drain: " .. start_error)
+                return
+            end
+            set_output_stage(task, "await_input")
+        end
         return
     end
 
@@ -832,12 +1029,18 @@ local function service_output()
                 fail_output_task(task, "inventory_mismatch", NAME_OUTPUT_IN_VALVE .. " received wrong prefab")
                 return
             end
+            if not safe_write(task.group.silo.ref_id, LT.Open, 0) then
+                fail_output_task(task, "device_error", task.group.label .. " close")
+                return
+            end
             if item.quantity > task.group.confirmed_quantity then
                 fail_output_task(task, "ledger_invariant", task.group.label .. " output exceeds confirmed quantity")
                 return
             end
             task.buffered_quantity = task.buffered_quantity + item.quantity
-            task.remaining_source_stacks = task.remaining_source_stacks - 1
+            if task.draining_group then
+                task.drain_source_observed = true
+            end
             task.group.confirmed_quantity = task.group.confirmed_quantity - item.quantity
             state.inventory_revision = state.inventory_revision + 1
             persist()
@@ -868,8 +1071,9 @@ local function service_output()
                 fail_output_task(task, "device_error", NAME_OUTPUT_STACKER)
                 return
             end
-            release_valve(output_valve, state.splitters.output, true)
-            set_output_stage(task, "await_delivery_clear")
+            if release_valve(output_valve, state.splitters.output, true) then
+                set_output_stage(task, "await_delivery_clear")
+            end
         end
         return
     end
@@ -910,8 +1114,9 @@ local function service_output()
                 fail_output_task(task, "device_error", NAME_OUTPUT_STACKER)
                 return
             end
-            release_valve(output_valve, state.splitters.output, false)
-            set_output_stage(task, "await_return_clear")
+            if release_valve(output_valve, state.splitters.output, false) then
+                set_output_stage(task, "await_return_clear")
+            end
         end
         return
     end
@@ -1107,11 +1312,38 @@ local function initialize()
     restore_persistence()
     set_phase("discovering")
     local topology_errors
+    local best_group_count = -1
+    local stable_signature
+    local stable_scans = 0
     for attempt = 1, MAX_DISCOVERY_ATTEMPTS do
         local discovered
         discovered, topology_errors = discover_topology()
         if discovered then
-            break
+            local signature = topology_signature()
+            if state.group_count > best_group_count then
+                best_group_count = state.group_count
+                stable_signature = signature
+                stable_scans = 1
+            elseif state.group_count == best_group_count and signature == stable_signature then
+                stable_scans = stable_scans + 1
+            elseif state.group_count == best_group_count then
+                stable_signature = signature
+                stable_scans = 1
+            else
+                stable_scans = 0
+                topology_errors = { "topology_regressed: expected at least " .. tostring(best_group_count) .. " groups, observed " .. tostring(state.group_count) }
+                discovered = false
+            end
+            if discovered then
+                print("StorageController: topology confirmation " .. tostring(stable_scans) .. "/" .. tostring(DISCOVERY_STABLE_SCANS) .. " with " .. tostring(state.group_count) .. " groups")
+                if stable_scans >= DISCOVERY_STABLE_SCANS then
+                    break
+                end
+                discovered = false
+                topology_errors = { "topology_not_stable: waiting for matching device snapshots" }
+            end
+        else
+            stable_scans = 0
         end
         topology_errors = topology_errors or { "topology_scan_failed: no diagnostic returned" }
         print("StorageController: topology scan " .. tostring(attempt) .. "/" .. tostring(MAX_DISCOVERY_ATTEMPTS) .. " incomplete: " .. table.concat(topology_errors, "; "))
