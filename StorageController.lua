@@ -41,6 +41,7 @@ local state = {
     queue = {},
     active_request_id = nil,
     output_task = nil,
+    stray = nil,
     state_revision = 0,
     inventory_revision = 0,
     sequence = 0,
@@ -214,6 +215,14 @@ end
 
 local function is_stacker_prefab(prefab_hash)
     return prefab_hash == PREFAB_STACKER or prefab_hash == PREFAB_STACKER_REVERSE
+end
+
+local function item_name(prefab_hash)
+    local ok, name = pcall(prefab_name, prefab_hash)
+    if ok and name then
+        return name
+    end
+    return tostring(prefab_hash)
 end
 
 local function add_bucket(buckets, name, kind, device)
@@ -402,7 +411,7 @@ local function decode_silo_stack(word)
         return nil
     end
     if quantity == 1 then
-        print("StorageController: SDB memory quantity is 1 for prefab " .. tostring(prefab_hash) .. "; overriding quantity to 500")
+        print("StorageController: SDB memory quantity is 1 for " .. item_name(prefab_hash) .. "; overriding quantity to 500")
         quantity = 500
     end
     return {
@@ -485,7 +494,7 @@ local function set_assignment(group, prefab_hash)
     group.assignment_source = "new_input"
     group.state = "assigned"
     state.prefab_groups[prefab_hash] = group
-    print("StorageController: assigned " .. group.label .. " to prefab " .. tostring(prefab_hash))
+    print("StorageController: assigned " .. group.label .. " to " .. item_name(prefab_hash))
     return true
 end
 
@@ -539,7 +548,7 @@ local function recover_assignments()
                     group.assignment_source = "sorter_memory"
                     group.state = "assigned"
                     state.prefab_groups[prefab_hash] = group
-                    print("StorageController: recovered " .. group.label .. " assignment for prefab " .. tostring(prefab_hash))
+                    print("StorageController: recovered " .. group.label .. " assignment for " .. item_name(prefab_hash))
                 end
             end
         end
@@ -593,6 +602,14 @@ local function baseline_inventory()
             end
             if silo_slots == 0 then
                 group.confirmed_quantity = pending
+                if pending > 0 then
+                    print("StorageController: " .. group.label .. " recovered " .. tostring(pending) .. " units of " .. item_name(group.assignment_prefab_hash) .. " from stacker")
+                elseif group.assignment_prefab_hash then
+                    local cleared, clear_err = clear_assignment(group)
+                    if not cleared then
+                        add_error("sorter_memory_clear_failed", group.label .. ": " .. tostring(clear_err))
+                    end
+                end
             else
                 local word, memory_error
                 if group.label == "0x0000" then
@@ -606,7 +623,7 @@ local function baseline_inventory()
                     group.confirmed_quantity = silo_slots * stack.quantity + pending
                     group.silo_memory_words[0] = word
                     group.silo_memory_cursor = 1
-                    print("StorageController: " .. group.label .. " recovered " .. tostring(group.confirmed_quantity) .. " units from " .. tostring(silo_slots) .. " silo stacks")
+                    print("StorageController: " .. group.label .. " recovered " .. tostring(group.confirmed_quantity) .. " units of " .. item_name(group.assignment_prefab_hash) .. " from " .. tostring(silo_slots) .. " silo stacks")
                 else
                     group.state = "inventory_unknown"
                     group.confirmed_quantity = pending
@@ -690,7 +707,8 @@ local function release_valve(valve, splitter, route_one)
             fault("movement_timeout", valve.display_name .. " did not clear")
         end
         local item = read_item(valve.ref_id)
-        if item == nil then
+        local open = safe_read(valve.ref_id, LT.Open)
+        if item == nil or open == 0 then
             valve.releasing = false
             print("StorageController: " .. valve.display_name .. " cleared")
         end
@@ -755,9 +773,9 @@ local function service_input()
         group.confirmed_quantity = group.confirmed_quantity + item.quantity
         state.inventory_revision = state.inventory_revision + 1
         persist()
-        print("StorageController: admitted " .. tostring(item.quantity) .. " of prefab " .. tostring(item.prefab_hash) .. " to " .. group.label)
+        print("StorageController: admitted " .. tostring(item.quantity) .. " of " .. item_name(item.prefab_hash) .. " to " .. group.label)
     else
-        print("StorageController: no free group for prefab " .. tostring(item.prefab_hash) .. "; forwarding to fail path")
+        print("StorageController: no free group for " .. item_name(item.prefab_hash) .. "; forwarding to fail path")
     end
     release_valve(valve)
 end
@@ -787,7 +805,7 @@ local function service_fail()
             end
         end
     end
-    print("StorageController: fail valve routing prefab " .. tostring(item.prefab_hash) .. " to " .. (group and "input" or "dump"))
+    print("StorageController: fail valve routing " .. item_name(item.prefab_hash) .. " to " .. (group and "input" or "dump"))
     release_valve(valve, state.splitters.fail, group ~= nil)
 end
 
@@ -863,9 +881,12 @@ local function start_group_drain(task, stacker_item)
     task.drain_empty_ticks = 0
     task.drain_source_observed = false
     task.group.pending_quantity = stacker_item.quantity
+    task.silo_watch_count = nil
+    task.silo_closed = true
     if not safe_write(task.group.silo.ref_id, LT.Open, 1) then
         return false, "silo open"
     end
+    task.silo_closed = false
     if not safe_write(task.group.stacker.ref_id, LT.Activate, 1) then
         return false, "stacker activate"
     end
@@ -893,6 +914,14 @@ local function service_group_drain(task)
     if task.drain_empty_ticks < DRAIN_EMPTY_CONFIRM_TICKS then
         return true
     end
+    if not safe_write(task.group.silo.ref_id, LT.Open, 0) then
+        return false, "silo close"
+    end
+    local silo_open, open_error = safe_read(task.group.silo.ref_id, LT.Open)
+    if open_error ~= nil or silo_open ~= 0 then
+        return false, "silo close did not confirm: " .. tostring(open_error or silo_open)
+    end
+    task.silo_closed = true
     for _, request_id in ipairs(state.queue) do
         local queued_request = state.requests[request_id]
         if queued_request and queued_request.state == "queued" and queued_request.group_id == task.group.id then
@@ -926,7 +955,135 @@ local function complete_output_task(task)
     persist()
 end
 
+-- Return idle or unexpected items from any point in the shared output path.
+local function service_output_return()
+    local input_valve = state.valves.output_in
+    local output_valve = state.valves.output_out
+    local stray = state.stray
+    if stray then
+        if now() - stray.stage_tick > VALVE_TIMEOUT_TICKS then
+            fault("movement_timeout", "output return stage " .. stray.stage)
+            return
+        end
+        if stray.stage == "await_stacker" then
+            local output_item, output_item_error = read_stacker_item(state.output_stacker.ref_id)
+            if output_item_error then
+                fault("device_error", NAME_OUTPUT_STACKER .. ": " .. output_item_error)
+                return
+            end
+            if not output_item then
+                return
+            end
+            if output_item.prefab_hash ~= stray.prefab_hash or output_item.quantity ~= stray.quantity then
+                fault("inventory_mismatch", NAME_OUTPUT_STACKER .. " does not hold the expected returned stack")
+                return
+            end
+            if not command_stacker_output(stray.quantity) then
+                fault("device_error", NAME_OUTPUT_STACKER)
+                return
+            end
+            stray.stage = "await_output"
+            stray.stage_tick = now()
+            return
+        end
+        if stray.stage == "await_output" then
+            local item, item_error = read_item(output_valve.ref_id)
+            if item_error then
+                fault("device_error", NAME_OUTPUT_OUT_VALVE .. ": " .. item_error)
+                return
+            end
+            if item then
+                if item.prefab_hash ~= stray.prefab_hash or item.quantity ~= stray.quantity then
+                    fault("inventory_mismatch", NAME_OUTPUT_OUT_VALVE .. " returned stack quantity mismatch")
+                    return
+                end
+                if not safe_write(state.output_stacker.ref_id, LT.Output, -1) then
+                    fault("device_error", NAME_OUTPUT_STACKER)
+                    return
+                end
+                if release_valve(output_valve, state.splitters.output, false) then
+                    stray.stage = "await_clear"
+                    stray.stage_tick = now()
+                end
+            end
+            return
+        end
+        release_valve(output_valve)
+        if not output_valve.releasing then
+            print("StorageController: returned stray stack of " .. tostring(stray.quantity) .. " to storage")
+            state.stray = nil
+        end
+        return
+    end
+
+    local task = state.output_task
+    if output_valve.releasing then
+        if task and (task.stage == "await_delivery_clear" or task.stage == "await_return_clear") then
+            return
+        end
+        release_valve(output_valve)
+        return
+    end
+    local output_item, output_error = read_item(output_valve.ref_id)
+    if output_error then
+        fault("device_error", NAME_OUTPUT_OUT_VALVE .. ": " .. output_error)
+        return
+    end
+    local expected_output = task and (task.stage == "await_output" or task.stage == "await_return")
+        and output_item and output_item.prefab_hash == task.request.prefab_hash
+        and output_item.quantity == task.portion_quantity
+    if output_item then
+        if not expected_output then
+            print("StorageController: " .. NAME_OUTPUT_OUT_VALVE .. " received unexpected " .. item_name(output_item.prefab_hash) .. "; returning it to storage")
+            state.stray = { quantity = output_item.quantity, prefab_hash = output_item.prefab_hash, stage = "await_output", stage_tick = now() }
+        end
+        return
+    end
+
+    local stacker_item, stacker_error = read_stacker_item(state.output_stacker.ref_id)
+    if stacker_error then
+        fault("device_error", NAME_OUTPUT_STACKER .. ": " .. stacker_error)
+        return
+    end
+    local expected_stacker = task and stacker_item and stacker_item.prefab_hash == task.request.prefab_hash
+    if stacker_item then
+        if not expected_stacker then
+            print("StorageController: " .. NAME_OUTPUT_STACKER .. " contains unexpected " .. item_name(stacker_item.prefab_hash) .. "; returning it to storage")
+            state.stray = { quantity = stacker_item.quantity, prefab_hash = stacker_item.prefab_hash, stage = "await_stacker", stage_tick = now() }
+        end
+        return
+    end
+
+    if input_valve.releasing then
+        if task and task.stage == "await_input" then
+            return
+        end
+        release_valve(input_valve)
+        return
+    end
+    local item, item_error = read_item(input_valve.ref_id)
+    if item_error then
+        fault("device_error", NAME_OUTPUT_IN_VALVE .. ": " .. item_error)
+        return
+    end
+    if not item then
+        return
+    end
+    if task and item.prefab_hash == task.request.prefab_hash and task.stage == "await_input" then
+        return
+    end
+    print("StorageController: " .. NAME_OUTPUT_IN_VALVE .. " received unexpected " .. item_name(item.prefab_hash) .. "; returning it to storage")
+    state.stray = { quantity = item.quantity, prefab_hash = item.prefab_hash, stage = "await_stacker", stage_tick = now() }
+    release_valve(input_valve)
+end
+
 local function service_output()
+    if state.stray then
+        if state.output_task then
+            state.output_task.stage_tick = now()
+        end
+        return
+    end
     local task = state.output_task or start_output_task()
     if not task then
         return
@@ -984,10 +1141,19 @@ local function service_output()
             set_output_stage(task, "await_input")
             return
         end
+        local max_stack_quantity = task.group.max_stack_quantity or 1
+        local stacks_needed = math.ceil(task.remaining_quantity / max_stack_quantity)
+        if stacks_needed > available_stacks then
+            stacks_needed = available_stacks
+        elseif stacks_needed < 1 then
+            stacks_needed = 1
+        end
         if not safe_write(task.group.silo.ref_id, LT.Open, 1) then
             fail_output_task(task, "device_error", task.group.label .. " open")
             return
         end
+        task.silo_watch_count = available_stacks - stacks_needed
+        task.silo_closed = false
         set_output_stage(task, "await_input")
         return
     end
@@ -1021,17 +1187,37 @@ local function service_output()
     end
 
     if task.stage == "await_input" then
+        if input_valve.releasing then
+            release_valve(input_valve)
+            return
+        end
+        if task.silo_watch_count ~= nil and not task.silo_closed then
+            local current_stacks, watch_quantity_error = safe_read(task.group.silo.ref_id, LT.Quantity)
+            if type(current_stacks) ~= "number" then
+                fail_output_task(task, "device_error", task.group.label .. " quantity: " .. tostring(watch_quantity_error))
+                return
+            end
+            if current_stacks <= task.silo_watch_count then
+                if not safe_write(task.group.silo.ref_id, LT.Open, 0) then
+                    fail_output_task(task, "device_error", task.group.label .. " close")
+                    return
+                end
+                task.silo_closed = true
+            end
+        end
         local item, item_error = read_item(input_valve.ref_id)
         if item_error then
             fail_output_task(task, "device_error", NAME_OUTPUT_IN_VALVE .. ": " .. item_error)
         elseif item then
             if item.prefab_hash ~= task.request.prefab_hash then
-                fail_output_task(task, "inventory_mismatch", NAME_OUTPUT_IN_VALVE .. " received wrong prefab")
                 return
             end
-            if not safe_write(task.group.silo.ref_id, LT.Open, 0) then
-                fail_output_task(task, "device_error", task.group.label .. " close")
-                return
+            if not task.silo_closed then
+                if not safe_write(task.group.silo.ref_id, LT.Open, 0) then
+                    fail_output_task(task, "device_error", task.group.label .. " close")
+                    return
+                end
+                task.silo_closed = true
             end
             if item.quantity > task.group.confirmed_quantity then
                 fail_output_task(task, "ledger_invariant", task.group.label .. " output exceeds confirmed quantity")
@@ -1045,14 +1231,6 @@ local function service_output()
             state.inventory_revision = state.inventory_revision + 1
             persist()
             release_valve(input_valve)
-            set_output_stage(task, "await_input_clear")
-        end
-        return
-    end
-
-    if task.stage == "await_input_clear" then
-        release_valve(input_valve)
-        if not input_valve.releasing then
             set_output_stage(task, "dispense")
         end
         return
@@ -1143,7 +1321,7 @@ end
 
 local function request_storage(payload, sender)
     if type(payload) == "table" then
-        print("StorageController: incoming request from " .. tostring(sender) .. " for " .. tostring(payload.quantity) .. " of prefab " .. tostring(payload.prefab_hash))
+        print("StorageController: incoming request from " .. tostring(sender) .. " for " .. tostring(payload.quantity) .. " of " .. item_name(payload.prefab_hash))
     else
         print("StorageController: incoming invalid request from " .. tostring(sender))
     end
@@ -1202,7 +1380,7 @@ local function request_storage(payload, sender)
     state.queue[#state.queue + 1] = request_id
     persist()
     publish("storage/v1/request/" .. request_id, request)
-    print("StorageController: queued request " .. request_id .. " for " .. tostring(payload.quantity) .. " of prefab " .. tostring(payload.prefab_hash))
+    print("StorageController: queued request " .. request_id .. " for " .. tostring(payload.quantity) .. " of " .. item_name(payload.prefab_hash))
     return { api_version = API_VERSION, ok = true, request_id = request_id, state = "queued", reserved_quantity = payload.quantity }
 end
 
@@ -1306,6 +1484,18 @@ local function register_api()
     ic.net.register("storage.get_config", get_config)
 end
 
+local function log_inventory_summary()
+    local total_quantity = 0
+    for id = 0, state.group_count - 1 do
+        local group = state.groups[id]
+        if group and group.assignment_prefab_hash then
+            print("StorageController: " .. group.label .. " holds " .. tostring(group.confirmed_quantity) .. " units of " .. item_name(group.assignment_prefab_hash))
+            total_quantity = total_quantity + group.confirmed_quantity
+        end
+    end
+    print("StorageController: startup inventory total " .. tostring(total_quantity) .. " units across " .. tostring(state.group_count) .. " groups")
+end
+
 local function initialize()
     print("StorageController: booting")
     register_api()
@@ -1361,6 +1551,7 @@ local function initialize()
         set_phase("invalid_topology")
         return
     end
+    log_inventory_summary()
     persist()
     set_phase("ready")
 end
@@ -1372,6 +1563,7 @@ while true do
     if state.phase == "ready" then
         service_input()
         service_fail()
+        service_output_return()
         service_output()
         if state.output_task == nil and #state.queue == 0 then
             scan_silo_memory()

@@ -54,11 +54,7 @@ while true do
         local pressed = ic.read_id(control.button, LT.Activate) ~= 0
         if pressed and not control.was_pressed then
             local quantity = math.floor(ic.read_id(control.dial, LT.Setting) + 0.5)
-            if quantity > 0 then
-                request_resource(control, quantity)
-            else
-                print(control.resource .. " request ignored: dial must be positive")
-            end
+            request_resource(control, quantity)
         end
         control.was_pressed = pressed
     end
