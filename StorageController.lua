@@ -301,6 +301,8 @@ local function discover_topology()
                 scan_complete = false,
                 silo_memory_cursor = 0,
                 silo_memory_words = {},
+                clearing_stacker = false,
+                clearing_tick = 0,
             }
         end
         buckets[label] = nil
@@ -501,6 +503,10 @@ end
 local function clear_assignment(group, next_state)
     local prefab_hash = group.assignment_prefab_hash
     group.state = next_state or "unassigned"
+    if group.state == "unassigned" then
+        group.clearing_stacker = false
+        group.clearing_tick = 0
+    end
     for address = 0, SORTER_ROWS - 1 do
         local ok, err = safe_memory_write(group.sorter.ref_id, address, 0)
         if not ok then
@@ -526,6 +532,8 @@ local function recover_assignments()
             add_error("sorter_memory_read_failed", group.label)
         elseif row0 == 0 then
             group.state = "unassigned"
+            group.clearing_stacker = false
+            group.clearing_tick = 0
             for address = 1, SORTER_ROWS - 1 do
                 if safe_memory_read(group.sorter.ref_id, address) ~= 0 then
                     add_error("invalid_sorter_program", group.label)
@@ -584,6 +592,50 @@ local function read_stacker_item(ref_id)
     return nil
 end
 
+local function clear_unassigned_groups()
+    local cleared_count = 0
+    for _, group in pairs(state.groups) do
+        if group.state == "unassigned" or group.state == "inventory_unknown" or not group.assignment_prefab_hash then
+            local stacker_item, stacker_error = read_stacker_item(group.stacker.ref_id)
+            if stacker_error then
+                add_error("stacker_read_failed", group.label .. ": " .. stacker_error)
+            elseif stacker_item then
+                print("StorageController: " .. group.label .. " has unassigned item " .. item_name(stacker_item.prefab_hash) .. " in stacker; clearing")
+                if not safe_write(group.stacker.ref_id, LT.Activate, 1) then
+                    add_error("stacker_activation_failed", group.label)
+                else
+                    cleared_count = cleared_count + 1
+                end
+            end
+            local silo_stacks = safe_read(group.silo.ref_id, LT.Quantity)
+            if type(silo_stacks) == "number" and silo_stacks > 0 then
+                print("StorageController: " .. group.label .. " has " .. tostring(silo_stacks) .. " unassigned silo stacks; draining")
+                if not safe_write(group.silo.ref_id, LT.Open, 1) then
+                    add_error("silo_open_failed", group.label)
+                else
+                    cleared_count = cleared_count + 1
+                end
+            end
+            group.state = "unassigned"
+            group.assignment_prefab_hash = nil
+            group.assignment_source = nil
+            group.confirmed_quantity = 0
+            group.pending_quantity = 0
+            group.max_stack_quantity = nil
+            group.silo_stack_count = 0
+            group.silo_memory_cursor = 0
+            group.silo_memory_words = {}
+            group.scan_complete = true
+            group.clearing_stacker = false
+            group.clearing_tick = 0
+        end
+    end
+    if cleared_count > 0 then
+        print("StorageController: cleared " .. tostring(cleared_count) .. " unassigned groups")
+    end
+    return #state.errors == 0
+end
+
 local function baseline_inventory()
     for _, group in pairs(state.groups) do
         local stacker_item, stacker_error = read_stacker_item(group.stacker.ref_id)
@@ -603,7 +655,8 @@ local function baseline_inventory()
             if silo_slots == 0 then
                 group.confirmed_quantity = pending
                 if pending > 0 then
-                    print("StorageController: " .. group.label .. " recovered " .. tostring(pending) .. " units of " .. item_name(group.assignment_prefab_hash) .. " from stacker")
+                    local prefab_name = group.assignment_prefab_hash and item_name(group.assignment_prefab_hash) or "unknown"
+                    print("StorageController: " .. group.label .. " recovered " .. tostring(pending) .. " units of " .. prefab_name .. " from stacker")
                 elseif group.assignment_prefab_hash then
                     local cleared, clear_err = clear_assignment(group)
                     if not cleared then
@@ -612,11 +665,7 @@ local function baseline_inventory()
                 end
             else
                 local word, memory_error
-                if group.label == "0x0000" then
-                    word, memory_error = probe_silo_memory(group)
-                else
-                    word, memory_error = safe_memory_read(group.silo.ref_id, 0)
-                end
+                word, memory_error = safe_memory_read(group.silo.ref_id, 0)
                 local stack = decode_silo_stack(word)
                 if stack and stack.prefab_hash == group.assignment_prefab_hash then
                     group.max_stack_quantity = stack.quantity
@@ -627,6 +676,10 @@ local function baseline_inventory()
                 else
                     group.state = "inventory_unknown"
                     group.confirmed_quantity = pending
+                    group.assignment_prefab_hash = nil
+                    group.assignment_source = nil
+                    group.clearing_stacker = false
+                    group.clearing_tick = 0
                     print("StorageController: " .. group.label .. " could not decode its first silo stack: " .. tostring(memory_error or word))
                 end
             end
@@ -666,7 +719,7 @@ end
 
 local function scan_silo_memory()
     for _, group in pairs(state.groups) do
-        if not group.scan_complete then
+        if not group.scan_complete and group.state ~= "draining_mismatch" and group.state ~= "inventory_unknown" then
             for _ = 1, MAX_SILO_MEMORY_READS_PER_TICK do
                 local scan_limit = math.min(group.silo_stack_count or 0, SILO_MEMORY_WORDS)
                 if group.silo_memory_cursor >= scan_limit then
@@ -684,6 +737,12 @@ local function scan_silo_memory()
                 if not stack or stack.prefab_hash ~= group.assignment_prefab_hash or stack.quantity ~= group.max_stack_quantity then
                     group.state = "inventory_mismatch"
                     print("StorageController: " .. group.label .. " stack " .. tostring(address) .. " does not match its recovered assignment")
+                    if stack and stack.prefab_hash and stack.prefab_hash ~= group.assignment_prefab_hash then
+                        print("StorageController: " .. group.label .. " contains wrong resource " .. item_name(stack.prefab_hash) .. " instead of " .. item_name(group.assignment_prefab_hash) .. "; draining")
+                        if safe_write(group.silo.ref_id, LT.Open, 1) then
+                            group.state = "draining_mismatch"
+                        end
+                    end
                 end
                 group.silo_memory_cursor = address + 1
             end
@@ -938,6 +997,8 @@ local function service_group_drain(task)
     task.group.silo_memory_cursor = 0
     task.group.silo_memory_words = {}
     task.group.scan_complete = true
+    task.group.clearing_stacker = false
+    task.group.clearing_tick = 0
     task.draining_group = false
     print("StorageController: released empty group " .. task.group.label)
     return true
@@ -1551,6 +1612,10 @@ local function initialize()
         set_phase("invalid_topology")
         return
     end
+    if not clear_unassigned_groups() then
+        set_phase("invalid_topology")
+        return
+    end
     log_inventory_summary()
     persist()
     set_phase("ready")
@@ -1561,11 +1626,119 @@ initialize()
 while true do
     state.tick = state.tick + 1
     if state.phase == "ready" then
+        local still_draining = false
+        for _, group in pairs(state.groups) do
+            if group.state == "draining_mismatch" then
+                local silo_stacks = safe_read(group.silo.ref_id, LT.Quantity)
+                local stacker_item = read_stacker_item(group.stacker.ref_id)
+                if type(silo_stacks) == "number" and silo_stacks == 0 and not stacker_item then
+                    print("StorageController: " .. group.label .. " finished draining mismatched resources")
+                    group.state = "unassigned"
+                    group.confirmed_quantity = 0
+                    group.pending_quantity = 0
+                    group.max_stack_quantity = nil
+                    group.silo_stack_count = 0
+                    group.silo_memory_cursor = 0
+                    group.silo_memory_words = {}
+                    group.scan_complete = true
+                    group.clearing_stacker = false
+                    group.clearing_tick = 0
+                    safe_write(group.silo.ref_id, LT.Open, 0)
+                else
+                    if type(silo_stacks) == "number" and silo_stacks == 0 and stacker_item then
+                        if not group.clearing_stacker then
+                            group.clearing_stacker = true
+                            group.clearing_tick = now()
+                            print("StorageController: " .. group.label .. " silo empty, closing to return stacker item to input")
+                            safe_write(group.silo.ref_id, LT.Open, 0)
+                        elseif now() - group.clearing_tick >= 3 then
+                            print("StorageController: " .. group.label .. " activating stacker to clear item")
+                            if not safe_write(group.stacker.ref_id, LT.Activate, 1) then
+                                add_error("stacker_activation_failed", group.label)
+                            end
+                            group.clearing_stacker = false
+                            safe_write(group.silo.ref_id, LT.Open, 0)
+                        end
+                    end
+                    still_draining = true
+                end
+            end
+            if group.state == "inventory_unknown" then
+                local silo_stacks = safe_read(group.silo.ref_id, LT.Quantity)
+                local stacker_item, stacker_error = read_stacker_item(group.stacker.ref_id)
+                if type(silo_stacks) == "number" and silo_stacks == 0 and not stacker_item and not stacker_error then
+                    print("StorageController: " .. group.label .. " resolved inventory_unknown state")
+                    group.state = "unassigned"
+                    group.confirmed_quantity = 0
+                    group.pending_quantity = 0
+                    group.max_stack_quantity = nil
+                    group.silo_stack_count = 0
+                    group.silo_memory_cursor = 0
+                    group.silo_memory_words = {}
+                    group.scan_complete = true
+                    group.clearing_stacker = false
+                    group.clearing_tick = 0
+                    safe_write(group.silo.ref_id, LT.Open, 0)
+                else
+                    if type(silo_stacks) == "number" and silo_stacks == 0 and stacker_item and not stacker_error then
+                        if not group.clearing_stacker then
+                            group.clearing_stacker = true
+                            group.clearing_tick = now()
+                            print("StorageController: " .. group.label .. " silo empty, closing to return stacker item to input")
+                            safe_write(group.silo.ref_id, LT.Open, 0)
+                        elseif now() - group.clearing_tick >= 3 then
+                            print("StorageController: " .. group.label .. " activating stacker to clear item")
+                            if not safe_write(group.stacker.ref_id, LT.Activate, 1) then
+                                add_error("stacker_activation_failed", group.label)
+                            end
+                            group.clearing_stacker = false
+                            safe_write(group.silo.ref_id, LT.Open, 0)
+                        end
+                    end
+                    still_draining = true
+                end
+            end
+            if group.state == "unassigned" then
+                local silo_stacks = safe_read(group.silo.ref_id, LT.Quantity)
+                if type(silo_stacks) == "number" and silo_stacks > 0 then
+                    print("StorageController: " .. group.label .. " has " .. tostring(silo_stacks) .. " unassigned silo stacks; draining")
+                    if not safe_write(group.silo.ref_id, LT.Open, 1) then
+                        add_error("silo_open_failed", group.label)
+                    else
+                        still_draining = true
+                    end
+                else
+                    local stacker_item, stacker_error = read_stacker_item(group.stacker.ref_id)
+                    if stacker_error then
+                        add_error("stacker_read_failed", group.label .. ": " .. stacker_error)
+                    elseif stacker_item then
+                        if not group.clearing_stacker then
+                            group.clearing_stacker = true
+                            group.clearing_tick = now()
+                            print("StorageController: " .. group.label .. " has unassigned item " .. item_name(stacker_item.prefab_hash) .. " in stacker; closing silo to return to input")
+                            safe_write(group.silo.ref_id, LT.Open, 0)
+                            still_draining = true
+                        elseif now() - group.clearing_tick >= 3 then
+                            print("StorageController: " .. group.label .. " activating stacker to clear item")
+                            if not safe_write(group.stacker.ref_id, LT.Activate, 1) then
+                                add_error("stacker_activation_failed", group.label)
+                            end
+                            group.clearing_stacker = false
+                            safe_write(group.silo.ref_id, LT.Open, 0)
+                        else
+                            still_draining = true
+                        end
+                    else
+                        group.clearing_stacker = false
+                    end
+                end
+            end
+        end
         service_input()
         service_fail()
         service_output_return()
         service_output()
-        if state.output_task == nil and #state.queue == 0 then
+        if state.output_task == nil and #state.queue == 0 and not still_draining then
             scan_silo_memory()
         end
         trim_history()
