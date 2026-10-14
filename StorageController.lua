@@ -385,6 +385,8 @@ local function configure_devices()
     configure(state.output_stacker.ref_id, LT.Output, -1, NAME_OUTPUT_STACKER)
     for _, splitter in pairs(state.splitters) do
         configure(splitter.ref_id, LT.On, 1, splitter.display_name)
+        configure(splitter.ref_id, LT.Setting, 0, splitter.display_name)
+        configure(splitter.ref_id, LT.SettingOutput, 0, splitter.display_name)
         configure(splitter.ref_id, LT.Mode, 0, splitter.display_name)
     end
     return #state.errors == 0
@@ -814,6 +816,11 @@ local function service_input()
     if not item then
         return
     end
+    local task = state.output_task
+    if task and task.draining_group and item.prefab_hash == task.request.prefab_hash
+        and task.remaining_quantity <= task.buffered_quantity then
+        return
+    end
     local group = state.prefab_groups[item.prefab_hash]
     if not group then
         group = lowest_free_group()
@@ -865,7 +872,7 @@ local function service_fail()
         end
     end
     print("StorageController: fail valve routing " .. item_name(item.prefab_hash) .. " to " .. (group and "input" or "dump"))
-    release_valve(valve, state.splitters.fail, group ~= nil)
+    release_valve(valve, state.splitters.fail, group == nil)
 end
 
 local transition
@@ -933,12 +940,11 @@ local function command_stacker_output(quantity)
 end
 
 local function start_group_drain(task, stacker_item)
-    if not clear_assignment(task.group, "draining") then
-        return false, "sorter assignment"
-    end
+    task.group.state = "draining"
     task.draining_group = true
     task.drain_empty_ticks = 0
     task.drain_source_observed = false
+    task.drain_close_tick = nil
     task.group.pending_quantity = stacker_item.quantity
     task.silo_watch_count = nil
     task.silo_closed = true
@@ -954,7 +960,7 @@ local function start_group_drain(task, stacker_item)
 end
 
 local function service_group_drain(task)
-    if not task.draining_group or not task.drain_source_observed then
+    if not task.draining_group then
         return true
     end
     local stacker_item, stacker_error = read_stacker_item(task.group.stacker.ref_id)
@@ -965,22 +971,61 @@ local function service_group_drain(task)
     if type(silo_stacks) ~= "number" then
         return false, "silo quantity: " .. tostring(quantity_error)
     end
-    if stacker_item or silo_stacks > 0 then
+    if task.drain_close_tick ~= nil
+        and (stacker_item or silo_stacks > 0 or task.group.confirmed_quantity > 0) then
+        if not safe_write(task.group.silo.ref_id, LT.Open, 1) then
+            return false, "silo reopen"
+        end
+        task.drain_close_tick = nil
+        task.silo_closed = false
+        task.drain_empty_ticks = 0
+    end
+    if stacker_item then
+        if stacker_item.prefab_hash ~= task.request.prefab_hash then
+            return false, "stacker contains wrong prefab"
+        end
+        local activate, activate_error = safe_read(task.group.stacker.ref_id, LT.Activate)
+        if activate_error ~= nil then
+            return false, "stacker activate: " .. tostring(activate_error)
+        end
+        if activate ~= 1 then
+            if not safe_write(task.group.stacker.ref_id, LT.Activate, 1) then
+                return false, "stacker activate"
+            end
+        end
         task.drain_empty_ticks = 0
         return true
     end
-    task.drain_empty_ticks = task.drain_empty_ticks + 1
-    if task.drain_empty_ticks < DRAIN_EMPTY_CONFIRM_TICKS then
+    if silo_stacks > 0 or task.group.confirmed_quantity > 0 or not task.drain_source_observed then
+        task.drain_empty_ticks = 0
         return true
     end
-    if not safe_write(task.group.silo.ref_id, LT.Open, 0) then
-        return false, "silo close"
+    if task.drain_close_tick == nil then
+        task.drain_empty_ticks = task.drain_empty_ticks + 1
+        if task.drain_empty_ticks < DRAIN_EMPTY_CONFIRM_TICKS then
+            return true
+        end
+        if not safe_write(task.group.silo.ref_id, LT.Open, 0) then
+            return false, "silo close"
+        end
+        task.drain_close_tick = now()
+        return true
     end
     local silo_open, open_error = safe_read(task.group.silo.ref_id, LT.Open)
-    if open_error ~= nil or silo_open ~= 0 then
+    if open_error ~= nil or type(silo_open) ~= "number" then
         return false, "silo close did not confirm: " .. tostring(open_error or silo_open)
     end
+    if silo_open ~= 0 then
+        if now() - task.drain_close_tick > VALVE_TIMEOUT_TICKS then
+            return false, "silo close did not confirm: " .. tostring(silo_open)
+        end
+        return true
+    end
+    task.drain_close_tick = nil
     task.silo_closed = true
+    if not clear_assignment(task.group) then
+        return false, "sorter assignment"
+    end
     for _, request_id in ipairs(state.queue) do
         local queued_request = state.requests[request_id]
         if queued_request and queued_request.state == "queued" and queued_request.group_id == task.group.id then
@@ -1014,6 +1059,27 @@ local function complete_output_task(task)
     state.active_request_id = nil
     state.output_task = nil
     persist()
+end
+
+local function matching_held_input(task, input_valve)
+    local held_item, held_item_error = read_item(input_valve.ref_id)
+    if held_item_error then
+        fail_output_task(task, "device_error", NAME_OUTPUT_IN_VALVE .. ": " .. held_item_error)
+        return true
+    end
+    if held_item and held_item.prefab_hash == task.request.prefab_hash then
+        set_output_stage(task, "await_input")
+        return true
+    end
+    return false
+end
+
+local function await_held_input(task, input_valve)
+    if task.draining_group then
+        set_output_stage(task, "await_input")
+        return true
+    end
+    return matching_held_input(task, input_valve)
 end
 
 -- Return idle or unexpected items from any point in the shared output path.
@@ -1130,7 +1196,10 @@ local function service_output_return()
     if not item then
         return
     end
-    if task and item.prefab_hash == task.request.prefab_hash and task.stage == "await_input" then
+    if task and item.prefab_hash == task.request.prefab_hash
+        and (task.stage == "await_input"
+            or (task.group.confirmed_quantity > 0
+                and (task.draining_group or task.remaining_quantity > task.buffered_quantity))) then
         return
     end
     print("StorageController: " .. NAME_OUTPUT_IN_VALVE .. " received unexpected " .. item_name(item.prefab_hash) .. "; returning it to storage")
@@ -1167,12 +1236,24 @@ local function service_output()
     end
     if task.stage == "dispense" then
         if task.buffered_quantity > 0 then
+            if task.remaining_quantity == 0 then
+                task.portion_quantity = task.buffered_quantity
+                if not command_stacker_output(task.portion_quantity) then
+                    fail_output_task(task, "device_error", NAME_OUTPUT_STACKER)
+                    return
+                end
+                set_output_stage(task, "await_return")
+                return
+            end
             task.portion_quantity = math.min(task.remaining_quantity, task.buffered_quantity)
             if not command_stacker_output(task.portion_quantity) then
                 fail_output_task(task, "device_error", NAME_OUTPUT_STACKER)
                 return
             end
             set_output_stage(task, "await_output")
+            return
+        end
+        if await_held_input(task, input_valve) then
             return
         end
         local available_stacks, quantity_error = safe_read(task.group.silo.ref_id, LT.Quantity)
@@ -1220,6 +1301,9 @@ local function service_output()
     end
 
     if task.stage == "await_source" then
+        if await_held_input(task, input_valve) then
+            return
+        end
         local available_stacks, quantity_error = safe_read(task.group.silo.ref_id, LT.Quantity)
         if type(available_stacks) ~= "number" then
             fail_output_task(task, "device_error", task.group.label .. " quantity: " .. tostring(quantity_error))
@@ -1273,7 +1357,7 @@ local function service_output()
             if item.prefab_hash ~= task.request.prefab_hash then
                 return
             end
-            if not task.silo_closed then
+            if not task.silo_closed and not task.draining_group then
                 if not safe_write(task.group.silo.ref_id, LT.Open, 0) then
                     fail_output_task(task, "device_error", task.group.label .. " close")
                     return
@@ -1289,6 +1373,16 @@ local function service_output()
                 task.drain_source_observed = true
             end
             task.group.confirmed_quantity = task.group.confirmed_quantity - item.quantity
+            if task.group.confirmed_quantity == 0 and not task.draining_group
+                and not task.reservation_released
+                and task.remaining_quantity <= task.buffered_quantity then
+                task.group.state = "draining"
+                task.draining_group = true
+                task.drain_source_observed = true
+                task.drain_empty_ticks = 0
+                task.drain_close_tick = nil
+                task.silo_watch_count = nil
+            end
             state.inventory_revision = state.inventory_revision + 1
             persist()
             release_valve(input_valve)
@@ -1324,7 +1418,11 @@ local function service_output()
             task.remaining_quantity = task.remaining_quantity - task.portion_quantity
             if task.remaining_quantity == 0 then
                 if task.buffered_quantity == 0 then
-                    complete_output_task(task)
+                    if task.draining_group then
+                        set_output_stage(task, "await_drain_clear")
+                    else
+                        complete_output_task(task)
+                    end
                 else
                     task.portion_quantity = task.buffered_quantity
                     if not command_stacker_output(task.portion_quantity) then
@@ -1360,9 +1458,25 @@ local function service_output()
         return
     end
 
+    if task.stage == "await_drain_clear" then
+        if task.draining_group then
+            if task.group.confirmed_quantity > 0 then
+                matching_held_input(task, input_valve)
+            end
+            return
+        end
+        complete_output_task(task)
+        return
+    end
+
     release_valve(output_valve)
     if not output_valve.releasing then
-        complete_output_task(task)
+        task.buffered_quantity = task.buffered_quantity - task.portion_quantity
+        if task.draining_group then
+            set_output_stage(task, "await_drain_clear")
+        else
+            complete_output_task(task)
+        end
     end
 end
 

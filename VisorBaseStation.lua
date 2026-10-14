@@ -9,8 +9,6 @@
 
 local WEATHER_STATION_PREFAB_HASH = 1997212478
 local SUIT_TRANSMITTER_NAME = "SuitTransmitter"
-local SIMULATION_MEMORY_NAME = "simulationMemory"
-local MIRROR_MEMORY_NAME = "MirrorMemory"
 local BATTERY_MIRROR_NAME = "BatteryMirror"
 local STATION_BATTERY_PREFAB_HASH = -400115994
 local LARGE_STATION_BATTERY_PREFAB_HASH = -1388288459
@@ -20,8 +18,6 @@ local SOUND_ALERT = LT.SoundAlert
 local function find_devices()
 	local weather_station_ref
 	local suit_transmitter_ref
-	local simulation_memory_ref
-	local mirror_memory_ref
 	local battery_mirror_ref
 	local battery_refs = {}
 
@@ -30,10 +26,6 @@ local function find_devices()
 			weather_station_ref = device.ref_id
 		elseif device.display_name == SUIT_TRANSMITTER_NAME then
 			suit_transmitter_ref = device.ref_id
-		elseif device.display_name == SIMULATION_MEMORY_NAME then
-			simulation_memory_ref = device.ref_id
-		elseif device.display_name == MIRROR_MEMORY_NAME then
-			mirror_memory_ref = device.ref_id
 		elseif device.display_name == BATTERY_MIRROR_NAME then
 			battery_mirror_ref = device.ref_id
 		end
@@ -44,7 +36,7 @@ local function find_devices()
 		end
 	end
 
-	return weather_station_ref, suit_transmitter_ref, simulation_memory_ref, mirror_memory_ref, battery_mirror_ref, battery_refs
+	return weather_station_ref, suit_transmitter_ref, battery_mirror_ref, battery_refs
 end
 
 local function try_run(phase, callback)
@@ -59,12 +51,10 @@ local sound_alert_sent = false
 
 while true do
 	local suit_transmitter_ref
-	local mirror_memory_ref
 
 	try_run("write", function()
-		local weather_station_ref, found_suit_transmitter_ref, simulation_memory_ref, found_mirror_memory_ref, battery_mirror_ref, battery_refs = find_devices()
+		local weather_station_ref, found_suit_transmitter_ref, battery_mirror_ref, battery_refs = find_devices()
 		suit_transmitter_ref = found_suit_transmitter_ref
-		mirror_memory_ref = found_mirror_memory_ref
 
 		if not battery_mirror_initialized and battery_mirror_ref ~= nil then
 			ic.write_id(battery_mirror_ref, LT.Mode, 2)
@@ -72,9 +62,8 @@ while true do
 			battery_mirror_initialized = true
 		end
 
-		if suit_transmitter_ref ~= nil and simulation_memory_ref ~= nil then
+		if suit_transmitter_ref ~= nil then
 			local seconds_remaining = ic.read_id(weather_station_ref, LT.NextWeatherEventTime)
-			-- local seconds_remaining = ic.read_id(simulation_memory_ref, LT.Setting)
 			local has_storm_time = seconds_remaining ~= nil and seconds_remaining ~= 0
 
 			if not has_storm_time then
@@ -117,13 +106,4 @@ while true do
 	end)
 
 	yield()
-
-	try_run("mirror", function()
-		if suit_transmitter_ref ~= nil and mirror_memory_ref ~= nil then
-			local mirrored_setting = ic.read_id(suit_transmitter_ref, LT.PressureSetting)
-			if mirrored_setting ~= nil then
-				ic.write_id(mirror_memory_ref, LT.Setting, mirrored_setting)
-			end
-		end
-	end)
 end
