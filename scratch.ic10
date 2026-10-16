@@ -1,0 +1,38 @@
+define Radiators -566775170 #Large Radiators Hash
+alias WeatherStat d0 #Weather Station
+alias sensor d1
+alias CountDown r0 #Countdown to Storm
+alias RadAction r1 #Radiators to Open or Close
+alias WeatherMode r2 #Mode from Weather Station
+alias h_angle r3
+define StormSoon 120 #Storm Timer in Seconds
+define RadSafety 15  #Timer to close radiators
+
+begin:
+# weather safety
+l CountDown WeatherStat NextWeatherEventTime
+l WeatherMode WeatherStat Mode
+beqz WeatherMode SwitchOff
+#RadAction = 1 if CountDown > RadSafety Else 0
+sgt RadAction CountDown RadSafety
+beq RadAction 1 SwitchOff
+#Batch radiators closed (0 If Storm)
+sb Radiators Open RadAction
+j begin
+
+SwitchOff:
+move RadAction 1 #Set RadAction to 1 (to open)
+sb Radiators Open RadAction #Batch radiators Open
+
+# tracking
+# Obtain horizontal angle
+l h_angle sensor Horizontal
+
+# Keep radiators perpendicular to the sun
+add h_angle h_angle 90
+
+# Write vertical angle to all solar panels
+sb Radiators Horizontal h_angle
+
+yield
+j begin

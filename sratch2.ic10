@@ -1,0 +1,58 @@
+# Heating radiator script
+# This code assumes the following:
+# Extendable radiator faceing south
+# Light sensor is inverted facing south
+
+
+alias sensor d0
+alias swarning d1
+alias v_angle r0
+alias h_angle r1
+alias sun_up r2
+alias warning r3
+
+define extendable_radiator -566775170
+
+start:
+# Check to see if sun is up
+l sun_up sensor Activate
+# check to see if storm is appro/occuring
+l warning swarning Setting
+bnez warning storm
+# Go to reset if it's not
+beqz sun_up reset
+
+Tracking:
+#open when the sun activates
+sb extendable_radiator Open 1
+# Calculate vertical angle
+l v_angle sensor Vertical
+
+# Write vertical angle to all solar panels
+
+# Obtain horizontal angle
+l h_angle sensor Horizontal
+
+# Write vertical angle to all solar panels
+sb extendable_radiator Horizontal h_angle
+
+# Go to start again
+yield
+j start
+
+#Storm Operations
+storm:
+sb extendable_radiator Open 0
+sleep 10
+l warning swarning Setting
+beqz warning start
+
+reset:
+sb extendable_radiator Open 0
+# Park solar panels vertically facing sunrise
+# Park solar panels horizontally facing sunrise
+sb extendable_radiator Horizontal 270
+# Wait 10 seconds
+sleep 10
+# Go to start again
+j start

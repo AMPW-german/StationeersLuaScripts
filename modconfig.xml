@@ -1,0 +1,171 @@
+<?xml version="1.0"?>
+<ModConfig xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Core Enabled="true">
+    <Path />
+  </Core>
+  <Local Enabled="true">
+    <Path Value="Workshop_3575541917" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3570622869" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3573780489" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3679710322" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3134483503" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3616788907" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3738676842" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3767869490" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3369296325" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3389894703" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3071913936" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3481848832" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3781742981" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3739533789" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3770552705" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3783237133" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3193624149" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3800163882" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3722922627" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3547208483" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3545236535" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3586526871" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3071985478" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3452651592" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3271740459" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3651839114" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3794718818" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3586442904" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3408132778" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3348479241" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3775923952" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3735049334" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3163662089" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3751750326" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3755414853" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3700849245" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_2876605527" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3783723341" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3587239682" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3796438640" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3592775931" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3659911735" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3666779631" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3787517570" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3104400225" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3730965440" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3770361309" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3724908136" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3774046989" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3783225282" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3634225688" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3765205032" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3421012428" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_3553424009" />
+  </Local>
+  <Local Enabled="true">
+    <Path Value="Workshop_2936575063" />
+  </Local>
+</ModConfig>
