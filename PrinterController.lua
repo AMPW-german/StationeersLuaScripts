@@ -37,6 +37,7 @@ local MAX_TASK_HISTORY = 128
 -- mutation, so a chip that halts mid-tick recovers on boot without re-reserving
 -- its resources.
 local JOURNAL_MAX = 128
+local ERRORS_MAX = 64
 
 local PERSISTENCE_KEY = "printer_controller_state"
 
@@ -146,6 +147,11 @@ local function add_error(code, detail)
     state.errors[#state.errors + 1] = {
         code = code, detail = detail, tick = now(),
     }
+    -- Bound the in-memory error log: a hostile or misbehaving caller that keeps
+    -- submitting bad requests must not grow the log unbounded and stall the chip.
+    while #state.errors > ERRORS_MAX do
+        table.remove(state.errors, 1)
+    end
     print("PrinterController: error " .. code .. (detail and (": " .. tostring(detail)) or ""))
 end
 
@@ -282,6 +288,37 @@ local function query_reservation(owner, reservation_id)
         cancelled = record.cancelled,
         done = record.done,
     }, nil
+end
+
+-- ============================ Storage line request (aggregated, one per task) ============================
+-- When a task is REACHED (pulled from the queue to active), the controller -- not
+-- the console -- computes the AGGREGATED quantity (per-item x count) and requests
+-- it from the storage line ONCE. This chip stays catalog-free: it forwards the
+-- per-reagent aggregate the console packed; the storage line maps reagent names
+-- to its routing/prefab. The call is fully guarded so an unavailable/declined
+-- storage line is logged and the chip continues (it never crashes on storage).
+local STORAGE_TARGET = "Storage.Controller"
+
+-- Guarded async-style net request that never throws: returns (result, err).
+-- The engine may call back via a callback, but as a server issuing an
+-- out-of-band client request we treat a synchronous return contract and guard
+-- the boundary so a missing/declining storage line cannot abort the tick.
+local function safe_request(target, method, payload, options)
+    local res = { pcall(ic.net.request, target, method, payload, options) }
+    if not res[1] then
+        return nil, "request_error:" .. tostring(res[2])
+    end
+    return res[2], res[3]
+end
+
+-- Expand a per-item cost vector to the aggregated (x count) total the storage
+-- line must be told to hold. Empty vectors produce an empty aggregate.
+local function aggregate_cost_vector(cost, count)
+    local agg = {}
+    for name, amount in pairs(cost or {}) do
+        agg[name] = amount * count
+    end
+    return agg
 end
 
 -- ============================ Durable journal + checkpoint ============================
@@ -431,6 +468,63 @@ local function restore_state()
     return true, "restored_" .. tostring(#state.task_order) .. "_tasks"
 end
 
+-- ============================ Storage line request (reached = aggregated, one per task) ============================
+-- Request the aggregated quantity from storage for a task once it is REACHED
+-- (pulled from the queue to active). Idempotent per reservation: the record's
+-- storage_requested flag guards against re-issuing on the same tick/recover.
+-- Failures are logged (controlled) and swallowed so the chip never aborts.
+-- Defined after the journal + restore section so journal_append / has_persist
+-- are captured as upvalues.
+local function request_storage_reservation(task)
+    local key = reservation_key(task.owner, task.reservation_id)
+    local record = state.reserved_ledger[key]
+    if record and record.storage_requested then
+        record.storage_state = record.storage_state or "requested"
+        return record.storage_result, "already_requested"
+    end
+    local agg = aggregate_cost_vector(task.cost_vector, task.count)
+    local payload = {
+        api_version = API_VERSION,
+        client_request_id = task.client_key,
+        reservation_id = task.reservation_id,
+        owner = task.owner,
+        item = task.item,
+        quantity = task.count,
+        family_id = task.family_id,
+        reagents = agg,
+    }
+    -- Journal the intent durably BEFORE the external send so a halt between
+    -- "reached" and "delivered" recovers the request without re-aggregating.
+    journal_append("storage_request", task.task_id, {
+        reservation_id = task.reservation_id, quantity = task.count,
+    })
+    if record then
+        record.storage_requested = true
+        record.storage_state = "sending"
+    end
+    local result, err = safe_request(STORAGE_TARGET, "storage.request", payload,
+        { origin = "printer-controller" })
+    if not result then
+        add_error("storage_request_error", tostring(err or "no_result"))
+        if record then
+            record.storage_state = "failed"
+        end
+        return nil, err or "storage_unavailable"
+    end
+    if type(result) == "table" and result.ok == false then
+        add_error("storage_request_rejected", tostring(result.err_code or result.code or "declined"))
+        if record then
+            record.storage_state = "rejected"
+        end
+        return nil, "storage_rejected"
+    end
+    if record then
+        record.storage_result = result
+        record.storage_state = "ok"
+    end
+    return result, nil
+end
+
 -- Discovery: find the six supported printers by prefab hash.
 local function discover_printers()
     state.printers = {}
@@ -536,10 +630,18 @@ local function transition(task, next_state, error_code)
     task.error_code = error_code
     task.sequence = state.sequence
     task.updated_tick = now()
-    ic.net.publish("printers/v1/task/" .. task.task_id, task)
+    -- Journal + flush FIRST so the recovery point is durable before any external
+    -- send. A publish failure is logged (controlled) and never loses the
+    -- transition: journal_append checkpoints the ledger so a halted chip recovers.
     journal_append("transition", task.task_id, {
         from = old_state, to = next_state, error_code = error_code,
     })
+    -- External send, guarded: a publish failure is captured and logged
+    -- (controlled), and a pcall failure cannot lose the transition above it.
+    local ok, err = pcall(ic.net.publish, "printers/v1/task/" .. task.task_id, task)
+    if not ok then
+        add_error("transition_publish_error", tostring(err))
+    end
 end
 
 local function lookup_task(task_id, sender)
@@ -555,20 +657,25 @@ end
 
 local function printers_request(payload, sender)
     if type(payload) ~= "table" or payload.api_version ~= API_VERSION then
+        add_error("invalid_request", "bad_type_or_version")
         return response_error("invalid_request")
     end
     if state.phase ~= "ready" then
+        -- Transient boot condition, not a bad request: do not log.
         return response_error("not_ready")
     end
     local owner = sender or payload.owner
     if type(payload.client_request_id) ~= "string" then
+        add_error("invalid_request", "bad_client_request_id")
         return response_error("invalid_request")
     end
     if type(payload.count) ~= "number" or payload.count <= 0 or payload.count % 1 ~= 0 then
+        add_error("invalid_quantity", tostring(payload.count))
         return response_error("invalid_quantity")
     end
     local family_id = payload.family_id or 1
     if type(payload.item) ~= "string" then
+        add_error("invalid_item", tostring(payload.item))
         return response_error("invalid_item")
     end
     local client_key = tostring(owner) .. ":" .. payload.client_request_id
@@ -586,15 +693,20 @@ local function printers_request(payload, sender)
         end
     end
     if #state.task_order >= MAX_QUEUE_LENGTH then
+        add_error("queue_full", "task_order " .. tostring(#state.task_order))
         return response_error("queue_full")
     end
     local cost, err, total = valid_cost_vector(payload.cost_vector)
     if not cost then
+        -- A structurally invalid recipe is a controlled, logged rejection: record
+        -- it and continue serving the rest of the queue.
+        add_error("invalid_recipe", tostring(err or "invalid_cost_vector"))
         return response_error(err or "invalid_cost_vector")
     end
     local record
     record, err = reserve_batch(owner, payload.client_request_id .. ":reserve", cost, payload.count)
     if not record then
+        add_error("reserve_failed", tostring(err))
         return response_error(err or "reserve_failed")
     end
     local reservation_id = payload.client_request_id .. ":reserve"
@@ -721,12 +833,27 @@ local function printers_get_config(payload)
     }
 end
 
+-- Every RPC handler is wrapped so a hostile or malformed payload -- or an
+-- internal bug -- can never crash the chip: the call is captured, logged, and a
+-- controlled error response returned. The raw handlers are what the tests call
+-- directly; these wrappers are what the network dispatches to.
+local function guarded(name, handler)
+    return function(payload, sender)
+        local ok, result = pcall(handler, payload, sender)
+        if not ok then
+            add_error(name .. "_crash", tostring(result))
+            return response_error("handler_error")
+        end
+        return result
+    end
+end
+
 local function register_api()
-    ic.net.register("printers.request", printers_request)
-    ic.net.register("printers.request_status", printers_request_status)
-    ic.net.register("printers.cancel", printers_cancel)
-    ic.net.register("printers.get_state", printers_get_state)
-    ic.net.register("printers.get_config", printers_get_config)
+    ic.net.register("printers.request", guarded("printers.request", printers_request))
+    ic.net.register("printers.request_status", guarded("printers.request_status", printers_request_status))
+    ic.net.register("printers.cancel", guarded("printers.cancel", printers_cancel))
+    ic.net.register("printers.get_state", guarded("printers.get_state", printers_get_state))
+    ic.net.register("printers.get_config", guarded("printers.get_config", printers_get_config))
 end
 
 -- Durable persistence is journal-based and lives in the "Durable journal +
@@ -766,7 +893,35 @@ local function set_phase_or_fallback()
     end
 end
 
--- Tick loop body: advance each task through its lifecycle.
+-- Tick loop body: advance each task through its lifecycle. Each task is served
+-- in isolation: a throw in one task (external I/O, a latent bug) is captured,
+-- logged, and that one task is marked failed -- it can neither skip the end-of
+-- tick checkpoint nor abort the rest of the queue.
+local function service_one(task)
+    if task.state == ST.QUEUED then
+        if state.printer_by_name[task.family_id] then
+            transition(task, ST.ACTIVE)
+            start_print(state.printer_by_name[task.family_id],
+                state.printers[state.printer_by_name[task.family_id]], task)
+            -- Once REACHED, the controller requests the AGGREGATED quantity from
+            -- storage once. The call is fully guarded inside; a missing/declining
+            -- storage line is logged and the tick continues.
+            request_storage_reservation(task)
+        end
+    elseif task.state == ST.ACTIVE then
+        -- Native completion is driven by hardware commission; here we
+        -- advance awaiting output then output done on confirm.
+        transition(task, ST.AWAITING_OUTPUT)
+    elseif task.state == ST.AWAITING_OUTPUT then
+        transition(task, ST.OUTPUT_DONE)
+    elseif task.state == ST.OUTPUT_DONE then
+        dispatch_reserved(task.owner, task.reservation_id, 1)
+        delivery_ack(task.owner, task.reservation_id)
+        transition(task, ST.COMPLETED)
+        trim_history()
+    end
+end
+
 local function service_tasks()
     for index = #state.task_order, 1, -1 do
         local task_id = state.task_order[index]
@@ -774,26 +929,21 @@ local function service_tasks()
         if not task then
             state.task_order[index] = nil
         else
-            if task.state == ST.QUEUED then
-                if state.printer_by_name[task.family_id] then
-                    transition(task, ST.ACTIVE)
-                    start_print(state.printer_by_name[task.family_id],
-                        state.printers[state.printer_by_name[task.family_id]], task)
+            local ok, err = pcall(service_one, task)
+            if not ok then
+                add_error("task_service_error", tostring(err) .. " on " .. tostring(task_id))
+                -- Controlled, in-place recovery: park this one bad task as failed
+                -- so it does not retry-forever or block the queue.
+                if task.state ~= ST.COMPLETED and task.state ~= ST.CANCELLED
+                    and task.state ~= ST.FAILED and task.state ~= ST.ABORTED then
+                    task.state = ST.FAILED
+                    task.error_code = "task_service_error"
                 end
-            elseif task.state == ST.ACTIVE then
-                -- Native completion is driven by hardware commission; here we
-                -- advance awaiting output then output done on confirm.
-                transition(task, ST.AWAITING_OUTPUT)
-            elseif task.state == ST.AWAITING_OUTPUT then
-                transition(task, ST.OUTPUT_DONE)
-            elseif task.state == ST.OUTPUT_DONE then
-                dispatch_reserved(task.owner, task.reservation_id, 1)
-                delivery_ack(task.owner, task.reservation_id)
-                transition(task, ST.COMPLETED)
-                trim_history()
             end
         end
     end
+    -- The end-of-tick checkpoint always runs, even if a task above failed, so the
+    -- durable recovery point is never skipped by a single bad task.
     checkpoint()
 end
 
@@ -808,22 +958,32 @@ end
 initialize()
 
 while true do
-    state.tick = state.tick + 1
-    if state.phase ~= "ready" then
-        if #state.printers == 0 then
-            local found = discover_printers()
-            if found > 0 then
-                for ref, record in pairs(state.printers) do
-                    if not state.printer_by_name[record.family] then
-                        state.printer_by_name[record.family] = ref
+    -- The whole tick is guarded: an uncaught error anywhere in the loop is
+    -- captured, logged, and the chip survives to the next yield instead of
+    -- halting. The journal/checkpoint inside service_tasks already make the
+    -- recovery point durable; this is the last line of crash protection.
+    local ok, err = pcall(function()
+        state.tick = state.tick + 1
+        if state.phase ~= "ready" then
+            if #state.printers == 0 then
+                local found = discover_printers()
+                if found > 0 then
+                    for ref, record in pairs(state.printers) do
+                        if not state.printer_by_name[record.family] then
+                            state.printer_by_name[record.family] = ref
+                        end
                     end
+                    state.phase = "ready"
+                    print("PrinterController: ready with " .. tostring(found) .. " printers")
                 end
-                state.phase = "ready"
-                print("PrinterController: ready with " .. tostring(found) .. " printers")
             end
+        elseif state.phase == "ready" then
+            service_tasks()
         end
-    elseif state.phase == "ready" then
-        service_tasks()
+    end)
+    if not ok then
+        add_error("tick_error", tostring(err))
+        checkpoint()
     end
     yield()
 end

@@ -518,6 +518,44 @@ do
 end
 
 --------------------------------------------
+-- TEST 8: Invalid-recipe logging + controlled continue
+--------------------------------------------
+print("\n[TEST 8] Invalid-request logging and controlled continue")
+
+do
+    local m = new_module()
+    local before = m.state.errors_seen
+
+    -- 8.1 a structurally wrong recipe (negative amount) is rejected ...
+    local bad = m.printers_request(
+        { api_version = 1, client_request_id = "bad-1", count = 1, item = "IronBar",
+          family_id = 1, cost_vector = { Iron = -5 } },
+        OWNER
+    )
+    ok(bad.ok == false and bad.code == "invalid_cost_amount",
+        "8.1 a negative-amount cost_vector is rejected")
+
+    -- 8.2 ... AND written to the error log (the controller logs + continues).
+    ok(m.state.errors_seen > before,
+        "8.2 the invalid recipe was logged (errors_seen advanced)")
+
+    -- 8.3 the chip CONTINUES: a subsequent valid request is still served.
+    local good = m.printers_request(
+        { api_version = 1, client_request_id = "good-1", count = 2, item = "IronBar",
+          family_id = 1, cost_vector = { Iron = 3 } },
+        OWNER
+    )
+    ok(good.ok == true and good.task_id ~= nil,
+        "8.3 a valid request after a bad one still queues (control continues)")
+    ok(good.reserved == 6, "8.3 the valid request reserved 2 x Iron(3) = 6")
+
+    -- 8.4 a wholly malformed payload (not a table) is rejected, not a crash.
+    local null = m.printers_request("not-a-table", OWNER)
+    ok(null.ok == false and null.code == "invalid_request",
+        "8.4 a non-table payload is rejected, not crash")
+end
+
+--------------------------------------------
 print(string.format(
     "\n=== PrinterController test suite: %d passed, %d failed ===",
     pass, fail

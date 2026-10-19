@@ -238,6 +238,33 @@ check("printer.request carried recipe", last_request and last_request.payload.re
 check("printer.request carried quantity", last_request and last_request.payload.quantity == 4)
 check("printer.request carried a client_request_id", last_request and type(last_request.payload.client_request_id) == "string")
 check("printer.request used the console destination", last_request and last_request.payload.destination_id == "Printer.Console")
+-- The console packed the per-ONE-item grams as a cost_vector plus the count;
+-- the catalog-free controller aggregates x count itself on the source chip.
+check("printer.request carried a cost_vector (per-item grams)",
+    last_request and type(last_request.payload.cost_vector) == "table")
+check("printer.request cost_vector held the per-item reagent grams",
+    last_request and type(last_request.payload.cost_vector) == "table"
+    and last_request.payload.cost_vector.Iron == 500)
+check("printer.request carried the single item name",
+    last_request and last_request.payload.item == "IronBar")
+check("printer.request carried the count (items to print)",
+    last_request and last_request.payload.count == 4)
+
+-- ================== Test 3b: unresolvable recipe is refused, not a crash ==================
+
+print("\n--- Test 3b: an unresolvable recipe is refused (no printers.request) ---")
+local reqs_before = (#net_requests)
+mod.state.preferences.selected_family = "TestFam"
+mod.state.preferences.selected_recipe = "GhostRecipe"  -- not in the config
+local rid_refuse = mod.submit_request()
+check("submit_request refused with nil when the recipe cannot be resolved", rid_refuse == nil)
+check("no new printers.request was issued for an unresolvable recipe",
+    (function()
+        for i = reqs_before + 1, #net_requests do
+            if net_requests[i].method == "printers.request" then return false end
+        end
+        return true
+    end)())
 
 -- ================== Test 4: cancel goes through printers.cancel ==================
 

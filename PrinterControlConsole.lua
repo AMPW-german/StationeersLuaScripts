@@ -181,6 +181,52 @@ end
 
 -- ================== Actions ==================
 
+-- Resolve the per-single-item reagent grams for the selected recipe.
+--
+-- The controller is catalog-free: it TRUSTS the per-item cost vector this chip
+-- packs, and aggregates (per-item x count) into the single storage request when
+-- the task is reached. So the console owns the "single item" knowledge: it pulls
+-- the recipe's per-reagent gram amounts from the controller-provided config and
+-- strips zeros, yielding a clean { reagent = grams } vector for ONE item. It
+-- never touches storage and never carries a controller revision.
+local function resolve_recipe_cost_vector(family_name, recipe_name)
+    local config = state.controller_config
+    if type(config) ~= "table" or type(config.families) ~= "table" then
+        return nil, "no_config"
+    end
+    local families = config.families
+    -- The config exposes families as a list of { name, recipes = { { name, reagents } } }
+    -- (hot-reloaded from the recipe catalog), so a fresh recipe set is available
+    -- without restarting the controller.
+    local family_entry
+    for _, fam in ipairs(families) do
+        if type(fam) == "table" and fam.name == family_name then
+            family_entry = fam
+            break
+        end
+    end
+    if not family_entry or type(family_entry.recipes) ~= "table" then
+        return nil, "unknown_family"
+    end
+    local recipe_entry
+    for _, recipe in ipairs(family_entry.recipes) do
+        if type(recipe) == "table" and recipe.name == recipe_name then
+            recipe_entry = recipe
+            break
+        end
+    end
+    if not recipe_entry or type(recipe_entry.reagents) ~= "table" then
+        return nil, "unknown_recipe"
+    end
+    local per_item = {}
+    for reagent, grams in pairs(recipe_entry.reagents) do
+        if type(reagent) == "string" and type(grams) == "number" and grams > 0 then
+            per_item[reagent] = grams
+        end
+    end
+    return per_item, nil
+end
+
 -- Submits a print job to the controller. Returns the client request id.
 function submit_request()
     local family = state.preferences.selected_family
@@ -193,11 +239,20 @@ function submit_request()
         print("PrinterConsole: controller not ready")
         return nil
     end
-    local ok, err = pcall(function()
-        if state.controller_config and state.controller_config.commission_check == true then
-            -- The controller enforces commission; the console just surfaces it.
-        end
-    end)
+
+    -- The console sends the per-single-item grams (cost_vector) plus the count;
+    -- the controller aggregates the total and requests it from storage once.
+    local cost_vector, cost_err = resolve_recipe_cost_vector(family, recipe)
+    if not cost_vector then
+        -- Surface the controller-side boundary reason to the operator instead of
+        -- letting a malformed request silently fall out. The catalog-free
+        -- controller would reject this as invalid_cost_vector; we pre-check.
+        print("PrinterConsole: cannot resolve recipe for " .. tostring(family) .. "/" ..
+            tostring(recipe) .. " (" .. tostring(cost_err) .. ")")
+        return nil
+    end
+
+    local count = clamp(state.preferences.selected_quantity, 1, 1000000)
 
     state.request_sequence = state.request_sequence + 1
     local client_request_id = string.format("pcc-%s-%d-%d",
@@ -209,8 +264,11 @@ function submit_request()
         api_version = API_VERSION,
         client_request_id = client_request_id,
         family_name = family,
-        recipe = recipe,
-        quantity = clamp(state.preferences.selected_quantity, 1, 1000000),
+        item = recipe,                 -- the single item being printed (controller key)
+        recipe = recipe,               -- legacy alias
+        cost_vector = cost_vector,     -- per-ONE-item reagent grams (catalog-derived)
+        count = count,                 -- items to print; controller aggregates x count
+        quantity = count,              -- legacy alias
         destination_id = CONSOLE_DESTINATION_ID,
         printer_ref = state.preferences.selected_printer,
     }
@@ -221,7 +279,9 @@ function submit_request()
             fetch_controller_state()
             fetch_controller_config()
         else
-            print("PrinterConsole: request failed: " .. tostring(rpc_err or (result and result.err_code)))
+            -- Display the controller's error code so the operator can act on it.
+            local code = tostring(rpc_err or (result and (result.err_code or result.code)) or "unknown")
+            print("PrinterConsole: request failed: " .. code)
         end
     end)
     return client_request_id

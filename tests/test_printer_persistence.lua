@@ -596,6 +596,56 @@ do
 end
 
 --------------------------------------------
+-- TEST P8: A reached task requests storage (aggregated), journaled before send
+--------------------------------------------
+print("\n[TEST P8] A reached task requests storage (aggregated), journaled before send")
+
+do
+    ctx.store = {}
+    ctx.handlers = nil
+
+    local m8 = new_module()
+    local created = m8.printers_request({
+        api_version = 1,
+        client_request_id = "job-8",
+        count = 3,
+        item = "IronBar",
+        family_id = 1,
+        cost_vector = { Iron = 2 },
+    }, OWNER)
+    ok(created and created.ok == true, "P8.1 the task was created")
+    local taskId = created.task_id
+
+    -- Drive the queue once: a reached task is pulled to active and the
+    -- controller requests the AGGREGATED quantity from storage once. The
+    -- storage line itself is not mocked here, so the external send is a guarded
+    -- no-result; what we lock is that the controller COMPUTED the aggregate
+    -- and journaled the intent durably BEFORE the external send, so a halt
+    -- between "reached" and "delivered" recovers the request without re-aggregating.
+    m8.service_tasks()
+
+    ok(m8.state.tasks[taskId] and m8.state.tasks[taskId].state == "active",
+        "P8.2 a reached task is active after one service pass")
+
+    -- The aggregated storage request was journaled (durable, before the send).
+    local saw_storage_request, saw_qty = false, nil
+    for _, entry in ipairs(m8.state.journal or {}) do
+        if entry.op == "storage_request" then
+            saw_storage_request = true
+            saw_qty = entry.quantity
+            ok(entry.reservation_id ~= nil,
+                "P8.3 the storage-request entry carried the reservation id")
+        end
+    end
+    ok(saw_storage_request, "P8.4 a reached task journaled its storage request")
+    ok(saw_qty == 3, "P8.5 the journaled storage request carried the item count (3)")
+
+    -- The controller aggregated per-item x count on the source chip: 2 x 3 = 6.
+    ok(m8.state.reserved[OWNER] == 6,
+        "P8.6 the controller-side aggregate is per-item x count = 6 on the owner")
+end
+
+--------------------------------------------
 print(string.rep("-", 60))
 print(string.format("Printer persistence: %d passed, %d failed", pass, fail))
 if fail > 0 then
