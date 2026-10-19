@@ -627,18 +627,26 @@ do
     ok(m8.state.tasks[taskId] and m8.state.tasks[taskId].state == "active",
         "P8.2 a reached task is active after one service pass")
 
-    -- The aggregated storage request was journaled (durable, before the send).
-    local saw_storage_request, saw_qty = false, nil
+    -- The aggregate is fanned out to one storage request PER reagent hash,
+    -- journaled (durable, before the send). The per-reagent quantity is the
+    -- ceiling of that reagent's aggregate mass (1 g == 1 item), so for this
+    -- single-reagent recipe it is ceil(2 x 3) = 6.
+    local saw_storage_request, saw_qty, req_count, saw_hash = false, nil, 0, false
     for _, entry in ipairs(m8.state.journal or {}) do
         if entry.op == "storage_request" then
             saw_storage_request = true
+            req_count = req_count + 1
             saw_qty = entry.quantity
             ok(entry.reservation_id ~= nil,
                 "P8.3 the storage-request entry carried the reservation id")
+            ok(entry.prefab_hash ~= nil,
+                "P8.3 the storage-request entry carried the reagent prefab hash")
         end
     end
     ok(saw_storage_request, "P8.4 a reached task journaled its storage request")
-    ok(saw_qty == 3, "P8.5 the journaled storage request carried the item count (3)")
+    ok(req_count == 1, "P8.5a exactly one storage request was fanned out for the single reagent")
+    ok(saw_qty == 6,
+        "P8.5 the journaled storage request carried ceil(aggregate grams) = 6")
 
     -- The controller aggregated per-item x count on the source chip: 2 x 3 = 6.
     ok(m8.state.reserved[OWNER] == 6,

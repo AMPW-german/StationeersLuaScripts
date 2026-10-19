@@ -54,6 +54,43 @@ local function generate_uuid()
     return string.gsub(template, '.', replace_char)
 end
 
+-- Centralized display-name converter. Internally the chip speaks prefab HASHES;
+-- names exist only here, for UI and logs (mirroring the storage console's
+-- item_name, which is the storage side's hash->name display path). For now it
+-- only strips the leading "Item" token (case-insensitive), e.g.
+-- "ItemCopperIngot" -> "CopperIngot". This is the SINGLE place a display name is
+-- derived, so UI and log paths can never diverge; expand it here, not at call sites.
+local function display_name(name_or_hash)
+    local s
+    if type(name_or_hash) == "string" then
+        s = name_or_hash
+    elseif type(name_or_hash) == "number" then
+        s = safe_call(prefab_name, name_or_hash) or tostring(name_or_hash)
+    else
+        s = tostring(name_or_hash)
+    end
+    return string.gsub(s, "^([iI]tem)", "")
+end
+
+-- Guarded runtime name -> prefab_hash resolution. The catalog provides reagent
+-- NAMES; the controller and storage speak prefab HASHES, so the console resolves
+-- the hash here via the engine's Animator.StringToHash / IC10 HASH() and keys the
+-- cost vector on it. Guarded so a missing or guarded engine capability logs and
+-- refuses instead of crashing the console.
+local function resolve_prefab_hash(reagent_name)
+    if type(hash) ~= "function" then
+        return nil, "no_hash_fn"
+    end
+    if type(reagent_name) ~= "string" then
+        return nil, "bad_reagent_name"
+    end
+    local ok, h = pcall(hash, reagent_name)
+    if not ok or type(h) ~= "number" then
+        return nil, "hash_failed"
+    end
+    return h, nil
+end
+
 -- ================== State ==================
 
 local state = {
@@ -184,15 +221,19 @@ end
 -- Resolve the per-single-item reagent grams for the selected recipe.
 --
 -- The controller is catalog-free: it TRUSTS the per-item cost vector this chip
--- packs, and aggregates (per-item x count) into the single storage request when
--- the task is reached. So the console owns the "single item" knowledge: it pulls
--- the recipe's per-reagent gram amounts from the controller-provided config and
--- strips zeros, yielding a clean { reagent = grams } vector for ONE item. It
--- never touches storage and never carries a controller revision.
+-- packs, and aggregates (per-item x count) into the storage request(s) when the
+-- task is reached. So the console owns the "single item" knowledge: it pulls the
+-- recipe's per-reagent gram amounts from the controller-provided config, strips
+-- zeros, and HASHES each reagent name to its prefab hash, yielding a clean
+-- { prefab_hash = grams } vector for ONE item plus a parallel { prefab_hash =
+-- display_name } label table for UI/logs only. It never touches storage and never
+-- carries a controller revision. Returns (cost_vector, labels, nil) on success or
+-- (nil, nil, reason) on a refusal (no_config/unknown_family/unknown_recipe/
+-- hash_unavailable).
 local function resolve_recipe_cost_vector(family_name, recipe_name)
     local config = state.controller_config
     if type(config) ~= "table" or type(config.families) ~= "table" then
-        return nil, "no_config"
+        return nil, nil, "no_config"
     end
     local families = config.families
     -- The config exposes families as a list of { name, recipes = { { name, reagents } } }
@@ -206,7 +247,7 @@ local function resolve_recipe_cost_vector(family_name, recipe_name)
         end
     end
     if not family_entry or type(family_entry.recipes) ~= "table" then
-        return nil, "unknown_family"
+        return nil, nil, "unknown_family"
     end
     local recipe_entry
     for _, recipe in ipairs(family_entry.recipes) do
@@ -216,15 +257,36 @@ local function resolve_recipe_cost_vector(family_name, recipe_name)
         end
     end
     if not recipe_entry or type(recipe_entry.reagents) ~= "table" then
-        return nil, "unknown_recipe"
+        return nil, nil, "unknown_recipe"
     end
     local per_item = {}
+    local labels = {}
+    -- The catalog provides reagent NAMES; the controller and storage speak prefab
+    -- HASHES, so hash each positive reagent and key the cost vector on the hash.
+    -- One gramm == one item, so a reagent's per-item grams pass straight through.
+    -- A parallel labels table keeps the human name for UI / logs only -- it is
+    -- NEVER sent as the controller/storage key.
     for reagent, grams in pairs(recipe_entry.reagents) do
         if type(reagent) == "string" and type(grams) == "number" and grams > 0 then
-            per_item[reagent] = grams
+            local h, herr = resolve_prefab_hash(reagent)
+            if not h then
+                -- A reagent we cannot resolve to a hash blocks this recipe: the
+                -- catalog-free controller would reject a name-keyed vector as
+                -- invalid. Log and refuse rather than emit a half-resolved vector.
+                print("PrinterConsole: cannot hash reagent '" .. reagent .. "' for " ..
+                    tostring(family_name) .. "/" .. tostring(recipe_name) .. " (" ..
+                    tostring(herr) .. ")")
+                return nil, nil, herr or "hash_failed"
+            end
+            if per_item[h] then
+                per_item[h] = per_item[h] + grams
+            else
+                per_item[h] = grams
+            end
+            labels[h] = display_name(reagent)
         end
     end
-    return per_item, nil
+    return per_item, labels, nil
 end
 
 -- Submits a print job to the controller. Returns the client request id.
@@ -240,9 +302,11 @@ function submit_request()
         return nil
     end
 
-    -- The console sends the per-single-item grams (cost_vector) plus the count;
-    -- the controller aggregates the total and requests it from storage once.
-    local cost_vector, cost_err = resolve_recipe_cost_vector(family, recipe)
+    -- The console sends the per-single-item grams as a HASH-KEYED cost_vector
+    -- (prefab_hash -> grams) plus the count and a UI-only display-name table; the
+    -- catalog-free controller aggregates (per-item x count) and requests storage
+    -- once the task is reached.
+    local cost_vector, labels, cost_err = resolve_recipe_cost_vector(family, recipe)
     if not cost_vector then
         -- Surface the controller-side boundary reason to the operator instead of
         -- letting a malformed request silently fall out. The catalog-free
@@ -263,10 +327,11 @@ function submit_request()
     local payload = {
         api_version = API_VERSION,
         client_request_id = client_request_id,
-        family_name = family,
-        item = recipe,                 -- the single item being printed (controller key)
+        family_name = family,          -- routing topology key (controller-owned)
+        item = recipe,                 -- product label for UI/logs (the family routes it)
         recipe = recipe,               -- legacy alias
-        cost_vector = cost_vector,     -- per-ONE-item reagent grams (catalog-derived)
+        cost_vector = cost_vector,     -- per-ONE-item reagent grams, HASH-KEYED (prefab_hash = grams)
+        reagent_labels = labels,       -- HASH -> display name, UI/logs only (never a controller/storage key)
         count = count,                 -- items to print; controller aggregates x count
         quantity = count,              -- legacy alias
         destination_id = CONSOLE_DESTINATION_ID,

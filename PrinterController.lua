@@ -171,7 +171,12 @@ local FAMILY_ID = {
 -- The controller is catalog-free: it TRUSTS the catalog-derived reagent vector
 -- that the console packed into the request, but it still verifies the SHAPE so a
 -- malformed or hostile request cannot poison the reservation ledger. A valid
--- vector is a table of reagent-name -> non-negative number. Returns
+-- vector is a table of reagent-key -> non-negative number. The key is either a
+-- reagent NAME (string) or its prefab HASH (number); internally the console
+-- hashes reagent names to prefab hashes (Animator.StringToHash / IC10 HASH()),
+-- so the cost_vector the controller aggregates and forwards to storage is
+-- hash-keyed. Both key types are accepted so a name-keyed or hash-keyed request
+-- validates; the aggregate is keyed however the console sent it. Returns
 -- (cleaned_copy, nil, total) on success or (nil, reason, 0) on failure.
 local function valid_cost_vector(raw)
     if type(raw) ~= "table" then
@@ -180,8 +185,8 @@ local function valid_cost_vector(raw)
     local cost = {}
     local total = 0
     for name, amount in pairs(raw) do
-        if type(name) ~= "string" or type(amount) ~= "number" or
-            amount ~= amount or amount < 0 then
+        if (type(name) ~= "string" and type(name) ~= "number") or
+            type(amount) ~= "number" or amount ~= amount or amount < 0 then
             return nil, "invalid_cost_amount", 0
         end
         if amount ~= 0 then
@@ -468,61 +473,83 @@ local function restore_state()
     return true, "restored_" .. tostring(#state.task_order) .. "_tasks"
 end
 
--- ============================ Storage line request (reached = aggregated, one per task) ============================
--- Request the aggregated quantity from storage for a task once it is REACHED
--- (pulled from the queue to active). Idempotent per reservation: the record's
--- storage_requested flag guards against re-issuing on the same tick/recover.
--- Failures are logged (controlled) and swallowed so the chip never aborts.
--- Defined after the journal + restore section so journal_append / has_persist
--- are captured as upvalues.
+-- ============================ Storage line request (reached = aggregated, one per reagent hash) ============================
+-- When a task is REACHED (pulled from the queue to active) the controller -- not
+-- the console -- computes the AGGREGATED quantity (per-item x count) and requests
+-- it from the storage line. The storage request contract is a single
+-- prefab_hash + integer quantity, so a multi-reagent task fans out to ONE request
+-- per reagent hash (quantity = ceil(aggregate grams); 1 g == 1 item). Per-reagent
+-- idempotency (record.storage_requested, keyed by prefab_hash) guards re-issue on
+-- the same tick / recovery. Failures are logged (controlled) and swallowed so the
+-- chip never aborts. Defined after the journal + restore section so journal_append
+-- / has_persist are captured as upvalues.
 local function request_storage_reservation(task)
     local key = reservation_key(task.owner, task.reservation_id)
     local record = state.reserved_ledger[key]
-    if record and record.storage_requested then
-        record.storage_state = record.storage_state or "requested"
-        return record.storage_result, "already_requested"
+    if not record then
+        -- Defensive: a task should always carry its reservation, but never let a
+        -- missing record crash the tick.
+        return nil, "no_reservation_record"
     end
+    record.storage_results = record.storage_results or {}
+    record.storage_requested = record.storage_requested or {}
+
+    -- Fan the multi-reagent aggregate out into ONE storage.request per reagent
+    -- hash: the storage request contract is a single prefab_hash + integer
+    -- quantity, so a multi-reagent task is split by reagent. The controller
+    -- stays catalog-free (it forwards the hash-keyed vector the console packed);
+    -- and 1 gram == 1 item, so a reagent's request quantity is the ceiling of
+    -- that reagent's aggregate mass (per-item grams x count).
     local agg = aggregate_cost_vector(task.cost_vector, task.count)
-    local payload = {
-        api_version = API_VERSION,
-        client_request_id = task.client_key,
-        reservation_id = task.reservation_id,
-        owner = task.owner,
-        item = task.item,
-        quantity = task.count,
-        family_id = task.family_id,
-        reagents = agg,
-    }
-    -- Journal the intent durably BEFORE the external send so a halt between
-    -- "reached" and "delivered" recovers the request without re-aggregating.
-    journal_append("storage_request", task.task_id, {
-        reservation_id = task.reservation_id, quantity = task.count,
-    })
-    if record then
-        record.storage_requested = true
-        record.storage_state = "sending"
-    end
-    local result, err = safe_request(STORAGE_TARGET, "storage.request", payload,
-        { origin = "printer-controller" })
-    if not result then
-        add_error("storage_request_error", tostring(err or "no_result"))
-        if record then
-            record.storage_state = "failed"
+    local saw_fail = false
+    local sent = 0
+    for prefab_hash, grams in pairs(agg) do
+        -- Per-reagent idempotency keyed on (owner,reservation,prefab_hash) so a
+        -- recovery re-run does not re-issue the same request.
+        local sub_key = task.client_key .. ":storage:" .. tostring(prefab_hash)
+        if not record.storage_requested[sub_key] then
+            local quantity = math.ceil(grams)
+            if quantity < 1 then
+                quantity = 1
+            end
+            -- Journal the intent durably BEFORE the external send (crash model:
+            -- guarded I/O + pre-send flush), so a halt between "reached" and
+            -- "delivered" recovers the request without re-aggregating.
+            journal_append("storage_request", task.task_id, {
+                reservation_id = task.reservation_id,
+                prefab_hash = prefab_hash,
+                quantity = quantity,
+            })
+            local payload = {
+                api_version = API_VERSION,
+                client_request_id = sub_key,
+                prefab_hash = prefab_hash,
+                quantity = quantity,
+                owner = task.owner,
+                reservation_id = task.reservation_id,
+                item = task.item,
+                family_id = task.family_id,
+            }
+            record.storage_requested[sub_key] = true
+            local result, err = safe_request(STORAGE_TARGET, "storage.request", payload,
+                { origin = "printer-controller" })
+            record.storage_results[sub_key] = result or false
+            sent = sent + 1
+            if type(result) == "table" and result.ok == false then
+                saw_fail = true
+                add_error("storage_request_rejected",
+                    "for hash " .. tostring(prefab_hash) .. " (" ..
+                    tostring(result.err_code or result.code or "declined") .. ")")
+            elseif not result then
+                saw_fail = true
+                add_error("storage_request_error",
+                    tostring(err or "no_result") .. " for hash " .. tostring(prefab_hash))
+            end
         end
-        return nil, err or "storage_unavailable"
     end
-    if type(result) == "table" and result.ok == false then
-        add_error("storage_request_rejected", tostring(result.err_code or result.code or "declined"))
-        if record then
-            record.storage_state = "rejected"
-        end
-        return nil, "storage_rejected"
-    end
-    if record then
-        record.storage_result = result
-        record.storage_state = "ok"
-    end
-    return result, nil
+    record.storage_state = saw_fail and "failed" or "ok"
+    record.storage_sent = sent
+    return record, nil
 end
 
 -- Discovery: find the six supported printers by prefab hash.

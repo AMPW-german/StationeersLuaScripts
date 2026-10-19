@@ -59,7 +59,8 @@ local function make_sandbox()
                     resp = { api_version = 1, ok = true, phase = "ready",
                         commission_check = false,
                         families = { { name = "TestFam", recipes = { { name = "IronBar", reagents = { Iron = 500 } } } },
-                                     { name = "Pipe Bender", recipes = { { name = "ElbowJoint", reagents = { Copper = 200 } } } } },
+                                     { name = "Pipe Bender", recipes = { { name = "ElbowJoint", reagents = { Copper = 200 } } } },
+                                     { name = "BadFam", recipes = { { name = "BadItem", reagents = { BadReagent = 10 } } } } },
                     }
                 elseif method == "printers.get_state" then
                     resp = { api_version = 1, ok = true, phase = "ready", task_count = 0, tasks = {},
@@ -100,7 +101,37 @@ local function make_sandbox()
         },
     }
     s.pcall = pcall
-    s.prefab_name = function() return "ItemTest" end
+    -- Engine Animator.StringToHash / IC10 HASH() mock: a deterministic
+    -- string->number hash with a prefab_name inverse, so a display_name(hash)
+    -- round-trips in the harness and the console's runtime name->hash path is
+    -- exercised (names are resolved to the controller/storage-facing prefab_hash).
+    local _hash_fwd = {}
+    local _hash_rev = {}
+    s.hash = function(name)
+        if type(name) ~= "string" then
+            return 0
+        end
+        -- Sentinel: a reagent the engine cannot hash surfaces as a pcall failure,
+        -- locking the console's "refuse, do not crash, do not emit a half-resolved
+        -- vector" branch (Test 3c).
+        if name == "BadReagent" then
+            error("sentinel: cannot hash reagent", 0)
+        end
+        local cached = _hash_fwd[name]
+        if cached then
+            return cached
+        end
+        local h = 0
+        for i = 1, #name do
+            h = (h * 31 + string.byte(name, i)) % 2147483647
+        end
+        _hash_fwd[name] = h
+        _hash_rev[h] = name
+        return h
+    end
+    s.prefab_name = function(h)
+        return _hash_rev[h]
+    end
     s._G = s
     setfenv(1, s)
     return s, net_requests, persist_store
@@ -238,13 +269,35 @@ check("printer.request carried recipe", last_request and last_request.payload.re
 check("printer.request carried quantity", last_request and last_request.payload.quantity == 4)
 check("printer.request carried a client_request_id", last_request and type(last_request.payload.client_request_id) == "string")
 check("printer.request used the console destination", last_request and last_request.payload.destination_id == "Printer.Console")
--- The console packed the per-ONE-item grams as a cost_vector plus the count;
--- the catalog-free controller aggregates x count itself on the source chip.
-check("printer.request carried a cost_vector (per-item grams)",
+-- The console packed the per-ONE-item grams as a HASH-KEYED cost_vector
+-- (prefab_hash -> grams) plus a UI-only reagent_labels table; the catalog-free
+-- controller aggregates x count itself on the source chip.
+check("printer.request carried a cost_vector",
     last_request and type(last_request.payload.cost_vector) == "table")
-check("printer.request cost_vector held the per-item reagent grams",
-    last_request and type(last_request.payload.cost_vector) == "table"
-    and last_request.payload.cost_vector.Iron == 500)
+do
+    local cv = last_request and last_request.payload.cost_vector
+    local labels = last_request and last_request.payload.reagent_labels
+    local all_numeric_key, found_500, single_hash, keys = true, false, nil, 0
+    for k, v in pairs(cv or {}) do
+        keys = keys + 1
+        if type(k) ~= "number" then
+            all_numeric_key = false
+        end
+        if v == 500 then
+            found_500 = true
+        end
+        single_hash = k
+    end
+    check("cost_vector is HASH-keyed: every key is a prefab_hash number",
+        keys > 0 and all_numeric_key)
+    check("cost_vector carries the per-item Iron gram amount (500)", found_500)
+    -- The reagent NAME must NOT leak into the controller/storage key space.
+    check("cost_vector is not name-keyed (no 'Iron' string key)",
+        not (cv and type(cv["Iron"]) == "number"))
+    -- The display name lives only in the parallel UI/log label table.
+    check("reagent_labels maps the hashed reagent to its display name",
+        type(labels) == "table" and labels[single_hash] == "Iron")
+end
 check("printer.request carried the single item name",
     last_request and last_request.payload.item == "IronBar")
 check("printer.request carried the count (items to print)",
@@ -261,6 +314,23 @@ check("submit_request refused with nil when the recipe cannot be resolved", rid_
 check("no new printers.request was issued for an unresolvable recipe",
     (function()
         for i = reqs_before + 1, #net_requests do
+            if net_requests[i].method == "printers.request" then return false end
+        end
+        return true
+    end)())
+
+-- ================== Test 3c: a reagent the engine cannot hash is refused, not a crash ==================
+
+print("\n--- Test 3c: an un-hashable reagent refuses the submit (no crash, no request) ---")
+local reqs_before3c = #net_requests
+mod.state.preferences.selected_family = "BadFam"
+mod.state.preferences.selected_recipe = "BadItem"  -- its only reagent cannot be hashed
+local rid_hash = mod.submit_request()
+check("submit_request refused with nil when a reagent cannot be hashed to a prefab_hash",
+    rid_hash == nil)
+check("no printers.request was issued for an un-hashable reagent",
+    (function()
+        for i = reqs_before3c + 1, #net_requests do
             if net_requests[i].method == "printers.request" then return false end
         end
         return true

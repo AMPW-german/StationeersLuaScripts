@@ -313,8 +313,15 @@ do
     local bad1 = m.valid_cost_vector({ Iron = -1 })
     ok(bad1 == nil, "1.4 a negative amount is rejected by valid_cost_vector")
 
-    local bad2 = m.valid_cost_vector({ [1] = 5 })
-    ok(bad2 == nil, "1.4 a non-string key is rejected by valid_cost_vector")
+    -- Internally the chip speaks prefab HASHES, so a numeric (hash) key is a
+    -- valid cost_vector key alongside a reagent name. Both are accepted.
+    local good2, good2_err, good2_total = m.valid_cost_vector({ [7] = 5 })
+    ok(good2 ~= nil and good2[7] == 5,
+        "1.4 a prefab-hash (numeric) key is accepted by valid_cost_vector")
+    ok(good2_err == nil and good2_total == 5,
+        "1.4 a hash-keyed amount contributes to the total")
+    local bad2 = m.valid_cost_vector({ [{}] = 5 })
+    ok(bad2 == nil, "1.4 a non-name/hash (table) key is rejected")
 
     local bad3 = m.valid_cost_vector("not-a-table")
     ok(bad3 == nil, "1.4 a non-table input is rejected by valid_cost_vector")
@@ -474,8 +481,15 @@ do
     -- 5.4 a negative amount is rejected
     ok(m.valid_cost_vector({ Iron = -1 }) == nil, "5.4 a negative amount is rejected")
 
-    -- 5.5 a non-string key is rejected
-    ok(m.valid_cost_vector({ [1] = 5 }) == nil, "5.5 a non-string key is rejected")
+    -- 5.5 internal comms are hash-keyed, so a numeric (prefab-hash) key is
+    -- accepted alongside a reagent name; a non-name/hash (table) key is rejected
+    do
+        local hk, hk_err, hk_total = m.valid_cost_vector({ [9] = 4 })
+        ok(hk ~= nil and hk[9] == 4 and hk_total == 4,
+            "5.5 a prefab-hash (numeric) key is accepted and counted")
+        ok(m.valid_cost_vector({ [{}] = 5 }) == nil,
+            "5.5 a non-name/hash (table) key is rejected")
+    end
 
     -- 5.6 a NaN amount is rejected (amount ~= amount)
     ok(m.valid_cost_vector({ Iron = 0 / 0 }) == nil, "5.6 a NaN amount is rejected")
