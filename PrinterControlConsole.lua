@@ -1,0 +1,426 @@
+--@module Printer Control Console (ScriptedScreens UI).
+--@version 1.1.0
+--@author Herme
+--@date 2026-10-16
+--
+-- Separate ScriptedScreens UI chip. This chip NEVER talks to storage directly
+-- (it owns no storage controller); every stateful action goes through the
+-- Printer.Controller RPC surface only. The reservation/queue/printer work is the
+-- controller's job.
+--
+-- RPC surface used (all to "Printer.Controller"):
+--   printers.get_state   -> poll phase/revision/task count
+--   printers.get_config  -> fetch families + recipes + commission_check
+--   printers.request     -> submit a print job
+--   printers.cancel      -> cancel an in-flight/queued task
+--
+-- Build note: this chip talks to the bundled controller, so a revision bump
+-- means a controller flash+restart, which is the accepted behavior.
+
+local API_VERSION = 1
+local POLL_INTERVAL = 1.0
+local CONTROLLER_TARGET = "Printer.Controller"
+local CONSOLE_DESTINATION_ID = "Printer.Console"
+
+-- ================== Helpers ==================
+
+local function safe_call(fn, ...)
+    local result = { pcall(fn, ...) }
+    if not result[1] then
+        print("Console error: " .. tostring(result[2]))
+        return nil, result[2]
+    end
+    return result[2]
+end
+
+local function clamp(value, min, max)
+    if not value then return min end
+    if value < min then return min end
+    if value > max then return max end
+    return value
+end
+
+local function generate_uuid()
+    local template = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
+    local function replace_char(c)
+        if c == 'x' then
+            return string.format('%x', math.random(0, 15))
+        elseif c == 'y' then
+            return string.format('%x', math.random(8, 11))
+        else
+            return c
+        end
+    end
+    return string.gsub(template, '.', replace_char)
+end
+
+-- ================== State ==================
+
+local state = {
+    console_uuid = nil,
+    controller_state = nil,
+    controller_config = nil,
+    last_state_revision = nil,
+    preferences = {
+        sort_mode = "by_phase",
+        current_page = 1,
+        panel_open = false,
+        selected_family = nil,
+        selected_recipe = nil,
+        selected_quantity = 1,
+        selected_printer = nil,
+    },
+    request_sequence = 0,
+    offline = false,
+    ui_surface = nil,
+}
+
+local safe_rpc_call
+local fetch_controller_state
+local fetch_controller_config
+local submit_request
+local cancel_task
+
+-- RPC helper: request against the printer controller only.
+function safe_rpc_call(method, payload, callback)
+    local ok, err = pcall(ic.net.request, CONTROLLER_TARGET, method, payload,
+        function(resp_ok, response, rpc_err)
+            if not resp_ok then
+                state.offline = true
+                if callback then callback(nil, "rpc_error") end
+                return
+            end
+            state.offline = false
+            if response and response.api_version == API_VERSION then
+                if callback then callback(response, nil) end
+            else
+                if callback then callback(nil, "invalid_response") end
+            end
+        end, 5)
+    if not ok then
+        state.offline = true
+        if callback then callback(nil, "rpc_unavailable") end
+    end
+    return ok
+end
+
+-- ================== Persistence ==================
+
+local PREFERENCES_KEY = "printerc_console_prefs"
+local UUID_KEY = "printerc_console_uuid"
+
+local function persist_preferences()
+    local prefs_to_save = {
+        sort_mode = state.preferences.sort_mode,
+        current_page = state.preferences.current_page,
+        panel_open = state.preferences.panel_open,
+        selected_family = state.preferences.selected_family,
+        selected_recipe = state.preferences.selected_recipe,
+        selected_quantity = state.preferences.selected_quantity,
+        selected_printer = state.preferences.selected_printer,
+    }
+    local ok, encoded = pcall(util.json.encode, prefs_to_save)
+    if ok and encoded then
+        safe_call(ic.persist.set, PREFERENCES_KEY, encoded)
+    end
+end
+
+local function restore_preferences()
+    local encoded = safe_call(ic.persist.get, PREFERENCES_KEY)
+    if encoded then
+        local ok, decoded = pcall(util.json.decode, encoded)
+        if ok and type(decoded) == "table" then
+            state.preferences.sort_mode = decoded.sort_mode or state.preferences.sort_mode
+            state.preferences.current_page = decoded.current_page or 1
+            if decoded.panel_open ~= nil then
+                state.preferences.panel_open = decoded.panel_open
+            end
+            state.preferences.selected_family = decoded.selected_family
+            state.preferences.selected_recipe = decoded.selected_recipe
+            if decoded.selected_quantity then
+                state.preferences.selected_quantity = decoded.selected_quantity
+            end
+            state.preferences.selected_printer = decoded.selected_printer
+        end
+    end
+end
+
+local function initialize_console_uuid()
+    local stored = safe_call(ic.persist.get, UUID_KEY)
+    if stored and type(stored) == "string" and #stored == 36 then
+        state.console_uuid = stored
+    else
+        state.console_uuid = generate_uuid()
+        safe_call(ic.persist.set, UUID_KEY, state.console_uuid)
+    end
+end
+
+-- ================== RPC surface wiring ==================
+
+function fetch_controller_state(callback)
+    safe_rpc_call("printers.get_state", {
+        api_version = API_VERSION,
+        include_tasks = true,
+    }, function(result, err)
+        if result then
+            state.controller_state = result
+            state.last_state_revision = result.revision
+        end
+        if callback then callback(result, err) end
+    end)
+end
+
+function fetch_controller_config(callback)
+    safe_rpc_call("printers.get_config", { api_version = API_VERSION }, function(result, err)
+        if result then
+            state.controller_config = result
+        end
+        if callback then callback(result, err) end
+    end)
+end
+
+-- ================== Actions ==================
+
+-- Submits a print job to the controller. Returns the client request id.
+function submit_request()
+    local family = state.preferences.selected_family
+    local recipe = state.preferences.selected_recipe
+    if not family then
+        print("PrinterConsole: no family selected")
+        return nil
+    end
+    if state.offline or not state.controller_state or state.controller_state.phase ~= "ready" then
+        print("PrinterConsole: controller not ready")
+        return nil
+    end
+    local ok, err = pcall(function()
+        if state.controller_config and state.controller_config.commission_check == true then
+            -- The controller enforces commission; the console just surfaces it.
+        end
+    end)
+
+    state.request_sequence = state.request_sequence + 1
+    local client_request_id = string.format("pcc-%s-%d-%d",
+        state.console_uuid,
+        math.floor(os.clock() * 1000),
+        state.request_sequence)
+
+    local payload = {
+        api_version = API_VERSION,
+        client_request_id = client_request_id,
+        family_name = family,
+        recipe = recipe,
+        quantity = clamp(state.preferences.selected_quantity, 1, 1000000),
+        destination_id = CONSOLE_DESTINATION_ID,
+        printer_ref = state.preferences.selected_printer,
+    }
+
+    safe_rpc_call("printers.request", payload, function(result, rpc_err)
+        if result and result.ok then
+            print("PrinterConsole: submitted " .. tostring(result.task_id))
+            fetch_controller_state()
+            fetch_controller_config()
+        else
+            print("PrinterConsole: request failed: " .. tostring(rpc_err or (result and result.err_code)))
+        end
+    end)
+    return client_request_id
+end
+
+-- Cancels an in-flight / queued / paused task.
+function cancel_task(task_id, reason)
+    local payload = {
+        api_version = API_VERSION,
+        request_id = task_id,
+        reason = reason or "console_cancel",
+        requester_id = state.console_uuid,
+    }
+    safe_rpc_call("printers.cancel", payload, function(result, rpc_err)
+        if result and result.ok then
+            print("PrinterConsole: cancelled " .. task_id)
+            fetch_controller_state()
+        else
+            print("PrinterConsole: cancel failed: " .. tostring(rpc_err or (result and result.err_code)))
+        end
+    end)
+end
+
+-- ================== UI (headless-safe) ==================
+
+local function get_status_pill_text()
+    if state.offline then return "OFFLINE" end
+    local cs = state.controller_state
+    if not cs then return "CONNECTING" end
+    local phase = cs.phase or "boot"
+    if phase == "ready" then return "READY" end
+    if phase == "paused" then return "PAUSED" end
+    return string.upper(tostring(phase))
+end
+
+local function get_status_pill_color()
+    if state.offline then return "#CC0000" end
+    local phase = state.controller_state and state.controller_state.phase
+    if phase == "ready" then return "#00994D" end
+    if phase == "paused" then return "#CC7A00" end
+    return "#999999"
+end
+
+local function render_task_list(s, task, x, y, width, height, index)
+    local row_h = height
+    s:element({
+        id = "task_" .. index .. "_state",
+        type = "text",
+        rect = { unit = "px", x = x, y = y, w = 260, h = row_h },
+        props = {
+            text = string.format("(%s) x%d %s %s",
+                tostring(task.state or "?"),
+                task.total_quantity or 0,
+                tostring(task.recipe or "?"),
+                tostring(task.state == "PRINTING" and task.print_progress and math.floor(task.print_progress * 100) or 0) .. "%"),
+        },
+        style = { text = "#FFFFFF", font_size = 11 },
+    })
+
+    if task.state ~= "DONE" and task.state ~= "CANCELLED" and task.state ~= "FAILED" then
+        s:element({
+            id = "cancel_" .. index,
+            type = "button",
+            rect = { unit = "px", x = x + width - 70, y = y, w = 65, h = 22 },
+            props = { text = "CANCEL" },
+            style = { bg = "#7A1E1E", text = "#FFFFFF", font_size = 10 },
+            on_click = function()
+                cancel_task(task.task_id, "console_cancel")
+            end,
+        })
+    end
+end
+
+local function render_families(s, x, y, width, height)
+    local config = state.controller_config
+    if not config or not config.families then return end
+    for i, fam in ipairs(config.families) do
+        s:element({
+            id = "family_" .. i,
+            type = "button",
+            rect = { unit = "px", x = x, y = y + (i - 1) * 24, w = width - 90, h = 22 },
+            props = { text = tostring(fam.name) },
+            style = { bg = "#2A2A3E", text = "#FFCC99", font_size = 11 },
+            on_click = function()
+                state.preferences.selected_family = fam.name
+                if fam.recipes and fam.recipes[1] then
+                    state.preferences.selected_recipe = fam.recipes[1].name
+                end
+                state.preferences.panel_open = true
+                persist_preferences()
+                render_ui()
+            end,
+        })
+    end
+end
+
+local function render_request_panel(s, width, height)
+    local panel_y = height - height * 0.24
+    s:element({
+        id = "request_label",
+        type = "text",
+        rect = { unit = "px", x = 20, y = panel_y + 4, w = width - 40, h = 16 },
+        props = { text = "PRINT REQUEST", font_size = 12 },
+        style = { text = "#99CCFF" },
+    })
+    s:element({
+        id = "request_button",
+        type = "button",
+        rect = { unit = "px", x = width - 160, y = panel_y + 4, w = 140, h = 26 },
+        props = { text = "REQUEST" },
+        style = { bg = "#00994D", text = "#FFFFFF", font_size = 13 },
+        on_click = function()
+            submit_request()
+        end,
+    })
+    s:element({
+        id = "qty_minus",
+        type = "button",
+        rect = { unit = "px", x = width - 350, y = panel_y + 4, w = 40, h = 26 },
+        props = { text = "-1" },
+        style = { bg = "#2A2A3E", text = "#99CCFF", font_size = 10 },
+        on_click = function()
+            state.preferences.selected_quantity = clamp(state.preferences.selected_quantity - 1, 1, 1000000)
+            persist_preferences()
+            render_ui()
+        end,
+    })
+    s:element({
+        id = "qty_plus",
+        type = "button",
+        rect = { unit = "px", x = width - 300, y = panel_y + 4, w = 40, h = 26 },
+        props = { text = "+1" },
+        style = { bg = "#2A2A3E", text = "#99CCFF", font_size = 10 },
+        on_click = function()
+            state.preferences.selected_quantity = clamp(state.preferences.selected_quantity + 1, 1, 1000000)
+            persist_preferences()
+            render_ui()
+        end,
+    })
+end
+
+function render_ui()
+    if not state.ui_surface then
+        state.ui_surface = ss.ui.surface("printerc")
+        ss.ui.activate("printerc")
+    end
+    local s = state.ui_surface
+    local size = s:size()
+    local width = tonumber(size.w) or 1024
+    local height = tonumber(size.h) or 768
+
+    s:clear()
+
+    -- Header: status pill + task count.
+    s:element({
+        id = "status_pill",
+        type = "text",
+        rect = { unit = "px", x = 12, y = 12, w = 200, h = 22 },
+        props = { text = get_status_pill_text() },
+        style = { text = get_status_pill_color(), font_size = 13, bold = true },
+    })
+    local task_count = state.controller_state and state.controller_state.task_count or 0
+    s:element({
+        id = "task_count_label",
+        type = "text",
+        rect = { unit = "px", x = 230, y = 12, w = 300, h = 22 },
+        props = { text = string.format("Tasks: %d   rev %s", task_count, tostring(state.last_state_revision or "?")), font_size = 11 },
+        style = { text = "#CCCCCC" },
+    })
+
+    render_families(s, 12, 50, 300, height - 60)
+    render_task_list(s, (state.controller_state and state.controller_state.tasks and state.controller_state.tasks[1]) or {}, 330, 50, width - 350, height - 120, 1)
+    if state.preferences.panel_open then
+        render_request_panel(s, width, height)
+    end
+end
+
+-- ================== Init ==================
+
+initialize_console_uuid()
+restore_preferences()
+fetch_controller_config()
+render_ui()
+
+-- ================== Main loop ==================
+
+local last_config_time = 0
+local last_poll_time = 0
+
+while true do
+    local current_time = os.clock()
+    if current_time - last_poll_time >= POLL_INTERVAL then
+        fetch_controller_state()
+        last_poll_time = current_time
+    end
+    if current_time - last_config_time >= 10.0 then
+        fetch_controller_config()
+        last_config_time = current_time
+        render_ui()
+    end
+    yield()
+end
