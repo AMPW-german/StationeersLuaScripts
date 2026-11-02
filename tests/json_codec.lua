@@ -41,7 +41,7 @@ function M.encode(t, indent)
         else
             for k, v in pairs(t) do
                 if v ~= nil then
-                    table.insert(parts, '"' .. escape(k) .. '": ' .. M.encode(v, inner))
+                    table.insert(parts, '"' .. escape(tostring(k)) .. '": ' .. M.encode(v, inner))
                 end
             end
             return '{ ' .. table.concat(parts, ', ') .. ' }'

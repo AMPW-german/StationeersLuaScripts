@@ -213,6 +213,19 @@ def parse_mod_config(path: str) -> List[Tuple[bool, str, str]]:
     return out
 
 
+def read_mod_name(mdir: str, fallback: str) -> str:
+    """Workshop display name from <mod>/About/About.xml <Name>, or fallback."""
+    about = os.path.join(mdir, "About", "About.xml")
+    if about and os.path.isfile(about):
+        try:
+            name_el = ET.parse(about).getroot().find("Name")
+            if name_el is not None and (name_el.text or "").strip():
+                return name_el.text.strip()
+        except ET.ParseError:
+            pass
+    return fallback
+
+
 def resolve_mod_dir(label: str, stored: str, mod_base: Optional[str]) -> str:
     """Resolve a mod's on-disk directory.
 
@@ -318,8 +331,20 @@ def parse_recipe_data(node, family, source_label, relpath, container, index,
         else:
             reasons.append("unknown_tier:%s" % tier_el.text.strip())
 
-    time = _scalar_decimal(node.find("Time").text if node.find("Time") is not None else None)
-    energy = _scalar_decimal(node.find("Energy").text if node.find("Energy") is not None else None)
+    # <Time>/<Energy> are children of <Recipe>; the RecipeData-level lookup is
+    # kept as a fallback for mods that nest them at the outer node instead.
+    def _scalar_from(el, tag):
+        if el is None:
+            return None
+        child = el.find(tag)
+        return _scalar_decimal(child.text if child is not None else None)
+
+    time = _scalar_from(recipe_el, "Time")
+    if time is None:
+        time = _scalar_from(node, "Time")
+    energy = _scalar_from(recipe_el, "Energy")
+    if energy is None:
+        energy = _scalar_from(node, "Energy")
 
     reagents: Dict[str, int] = {}
     reagent_child_count = 0
@@ -556,6 +581,7 @@ class Catalog:
         self.language: Optional[LanguageRegistry] = None
         self.known_reagents: Optional[set] = None
         self.sources_meta: List[dict] = []
+        self.mods: Dict[str, str] = {}         # workshop_id -> display name
         self.revision = ""
 
     def apply_source_in_order(self, source_label: str, candidates: List[Candidate]):
@@ -629,6 +655,7 @@ class Catalog:
             "effective_order": self.effective_order,
             "families": {},
             "ingots": {},
+            "mods": {k: self.mods[k] for k in sorted(self.mods)},
             "reagents": ({k: v for k, v in sorted(self.language.reagents.items())}
                          if self.language else {}),
             "things_count": len(self.language.things) if self.language else 0,
@@ -714,6 +741,11 @@ def build_catalog(game_root: str, mod_config_path: str,
             continue
         mod_cands = collect_candidates(mdir, wid, known)
         catalog.apply_source_in_order(wid, mod_cands)
+
+    # Mod display names for the console's source filter (About/About.xml).
+    for wid, mdir in mod_dirs:
+        if mdir and os.path.isdir(mdir):
+            catalog.mods[wid] = read_mod_name(mdir, wid)
 
     catalog.known_reagents = gather_known_reagents(catalog)
     catalog.build_ingots()
@@ -827,6 +859,11 @@ def emit_catalog(catalog: Catalog) -> str:
     L.append("  generated = {")
     L.append("    effective_order = { " + ", ".join(lua_str(x) for x in catalog.effective_order) + " },")
     L.append("  },")
+    L.append("")
+    mods_body = ", ".join(
+        "%s = %s" % (lua_key(wid), lua_str(name))
+        for wid, name in sorted(catalog.mods.items()))
+    L.append("  mods = { %s }," % mods_body)
     L.append("")
     L.append("  families = {")
     for family in ALL_FAMILIES:
@@ -954,6 +991,19 @@ eq(fam_count, {nfam}, "family count")
 eq(rec_count, {nrec}, "recipe count")
 eq(n_invalid, {ninvalid}, "invalid recipe count")
 
+-- 1b. capture: Time (seconds) is read inside <Recipe>; assert the field is
+-- populated (a regression made every recipe emit time = nil).
+local n_timed = 0
+for _, fam in pairs(catalog.families or {}) do
+  for _, rr in pairs(fam) do
+    if type(rr.time) == "number" then
+      n_timed = n_timed + 1
+    end
+  end
+end
+eq(n_timed, {ntimed}, "recipes with a captured time")
+check(n_timed > 0, "at least one recipe carries a captured time")
+
 -- 2. ingots / reagents
 local n_ing = 0
 for _ in pairs(catalog.ingots or {}) do n_ing = n_ing + 1 end
@@ -989,6 +1039,8 @@ def emit_test_script(catalog: Catalog,
     n_rec = sum(len(catalog.families[f]) for f in ALL_FAMILIES)
     n_invalid = sum(1 for fam in catalog.families.values()
                     for r in fam.values() if not r.valid)
+    n_timed = sum(1 for fam in catalog.families.values()
+                  for r in fam.values() if r.time is not None)
     n_ing = len(catalog.ingots)
     n_rea = len(catalog.language.reagents) if catalog.language else 0
     out = _TEST_TEMPLATE
@@ -998,6 +1050,7 @@ def emit_test_script(catalog: Catalog,
     out = out.replace("{nfam}", str(n_fam))
     out = out.replace("{nrec}", str(n_rec))
     out = out.replace("{ninvalid}", str(n_invalid))
+    out = out.replace("{ntimed}", str(n_timed))
     out = out.replace("{ning}", str(n_ing))
     out = out.replace("{nrea}", str(n_rea))
     return out

@@ -28,6 +28,21 @@ local function fresh_state()
     persist_store = {}
 end
 
+-- Module chips the console require()s over the network. The sandbox's require
+-- stub serves ONLY these (PrinterCatalog replaces the retired printers.get_config
+-- RPC as the recipe source); anything else errors, so ReagentItemMap degrades
+-- to the empty table exactly like a missing library chip in-engine.
+local MOCK_MODULES = {
+    PrinterCatalog = {
+        api_version = 1,
+        families = {
+            TestFam = { IronBar = { reagents = { Iron = 500 }, valid = true } },
+            ["Pipe Bender"] = { ElbowJoint = { reagents = { Copper = 200 }, valid = true } },
+            BadFam = { BadItem = { reagents = { BadReagent = 10 }, valid = true } },
+        },
+    },
+}
+
 local function make_sandbox()
     local s = setmetatable({ _G = {} }, { __index = _G })
     s.yield = function() end
@@ -35,6 +50,15 @@ local function make_sandbox()
     s.os = setmetatable({ clock = function() return 1.0 end }, { __index = _G.os })
     s.math = math
     s.pcall = pcall
+    -- Network require(): serves MOCK_MODULES only; a missing module raises so
+    -- the console's pcall-guarded require path degrades instead of crashing.
+    s.require = function(name, _force)
+        local m = MOCK_MODULES[name]
+        if m == nil then
+            error("module not found: " .. tostring(name), 0)
+        end
+        return m
+    end
     s.setfenv = _G._setfenv or setfenv
     s.setmetatable = setmetatable
     s.type = type
@@ -55,23 +79,24 @@ local function make_sandbox()
             request = function(target, method, payload, cb, timeout)
                 net_requests[#net_requests + 1] = { target = target, method = method, payload = payload }
                 local resp
-                if method == "printers.get_config" then
-                    resp = { api_version = 1, ok = true, phase = "ready",
-                        commission_check = false,
-                        families = { { name = "TestFam", recipes = { { name = "IronBar", reagents = { Iron = 500 } } } },
-                                     { name = "Pipe Bender", recipes = { { name = "ElbowJoint", reagents = { Copper = 200 } } } },
-                                     { name = "BadFam", recipes = { { name = "BadItem", reagents = { BadReagent = 10 } } } } },
-                    }
-                elseif method == "printers.get_state" then
-                    resp = { api_version = 1, ok = true, phase = "ready", task_count = 0, tasks = {},
-                             revision = "rev-1" }
+                if method == "printers.get_state" then
+                    resp = { api_version = 2, ok = true, phase = "ready", task_count = 0, tasks = {},
+                             revision = 1, time_multiplier = 1.0, recent_errors = {},
+                             printers = {
+                                 { family_id = 1, family_name = "autolathe",
+                                   prefab_hash = 213489205, ref_id = "ref-1",
+                                   status = "idle", active_task_id = nil },
+                             } }
+                elseif method == "printers.get_inventory" then
+                    resp = { api_version = 2, ok = true, revision = "inv-1",
+                             inventory = { [7] = { quantity = 10, available = 10 } } }
                 elseif method == "printers.request" then
-                    resp = { api_version = 1, ok = true, task_id = "task-1", queue_position = 1,
+                    resp = { api_version = 2, ok = true, task_id = "task-1", queue_position = 1,
                              cost_vector = { Iron = 5 } }
                 elseif method == "printers.cancel" then
-                    resp = { api_version = 1, ok = true, task_id = "task-1" }
+                    resp = { api_version = 2, ok = true, task_id = "task-1" }
                 else
-                    resp = { api_version = 1, ok = false, err_code = "unknown_method" }
+                    resp = { api_version = 2, ok = false, err_code = "unknown_method" }
                 end
                 cb(true, resp, nil)
                 return true
@@ -95,6 +120,7 @@ local function make_sandbox()
                 function surface:size() return { w = 1024, h = 768 } end
                 function surface:clear() end
                 function surface:element(spec) end
+                function surface:commit() end
                 return surface
             end,
             activate = function(id) end,
@@ -146,7 +172,7 @@ local function new_module()
         error("could not find main-loop marker in PrinterControlConsole.lua")
     end
     local body = string.sub(source, 1, marker - 1)
-    body = body .. "\nreturn { state=state, submit_request=submit_request, cancel_task=cancel_task, fetch_controller_state=fetch_controller_state, fetch_controller_config=fetch_controller_config }\n"
+    body = body .. "\nreturn { state=state, submit_request=submit_request, cancel_task=cancel_task, fetch_controller_state=fetch_controller_state }\n"
     local chunk, err = loadstring(body)
     if not chunk then
         error("printer console body failed to load: " .. tostring(err))
@@ -187,7 +213,6 @@ check("console module returned", mod ~= nil)
 check("exposes submit_request", mod.submit_request ~= nil)
 check("exposes cancel_task", mod.cancel_task ~= nil)
 check("exposes fetch_controller_state", mod.fetch_controller_state ~= nil)
-check("exposes fetch_controller_config", mod.fetch_controller_config ~= nil)
 check("exposes state", mod.state ~= nil)
 
 -- ================== Test 1: config + load did not touch storage ==================
@@ -195,7 +220,7 @@ check("exposes state", mod.state ~= nil)
 print("\n--- Test 1: init/config never touches storage ---")
 local function any_storage_contact()
     for _, req in ipairs(net_requests) do
-        if req.target == "Storage.Controller" or req.target == "Storage.Console" then
+        if type(req.target) == "string" and req.target:find("Storage", 1, true) then
             return true
         end
         if type(req.method) == "string" and string.find(req.method, "^storage%.", 1, true) then
@@ -207,7 +232,7 @@ end
 check("no storage controller contact", not any_storage_contact())
 check("all requests target Printer.Controller", (function()
     for _, req in ipairs(net_requests) do
-        if req.target ~= "Printer.Controller" then return false end
+        if req.target ~= "LuaC.Printer.Controller" then return false end
     end
     return true
 end)())
@@ -219,14 +244,15 @@ check("all methods are printers.*", (function()
     end
     return true
 end)())
-check("a printers.get_config was issued", (function()
+check("no printers.get_config RPC was issued (recipes come from the catalog chip)", (function()
     for _, req in ipairs(net_requests) do
-        if req.method == "printers.get_config" then return true end
+        if req.method == "printers.get_config" then return false end
     end
-    return false
+    return true
 end)())
-check("config response set families on controller_config",
-    mod.state.controller_config ~= nil and mod.state.controller_config.families ~= nil)
+check("the PrinterCatalog module populated state.catalog.families",
+    type(mod.state.catalog) == "table" and type(mod.state.catalog.families) == "table" and
+    mod.state.catalog.families.TestFam ~= nil)
 
 -- ================== Test 2: not-ready refuses submit ==================
 
@@ -263,10 +289,23 @@ for i = #net_requests, 1, -1 do
     end
 end
 check("a printers.request was issued", last_request ~= nil)
-check("printer.request targeted Printer.Controller", last_request and last_request.target == "Printer.Controller")
+check("printer.request targeted LuaC.Printer.Controller", last_request and last_request.target == "LuaC.Printer.Controller")
 check("printer.request carried family_name", last_request and last_request.payload.family_name == "TestFam")
-check("printer.request carried recipe", last_request and last_request.payload.recipe == "IronBar")
-check("printer.request carried quantity", last_request and last_request.payload.quantity == 4)
+check("printer.request carried the single item name",
+    last_request and last_request.payload.item == "IronBar")
+check("printer.request carried the count (items to print)",
+    last_request and last_request.payload.count == 4)
+-- API v2 trimmed payload: the legacy aliases and tier are gone.
+check("printer.request no longer carries the legacy 'recipe' alias",
+    last_request and last_request.payload.recipe == nil)
+check("printer.request no longer carries the legacy 'quantity' alias",
+    last_request and last_request.payload.quantity == nil)
+check("printer.request no longer carries printer_ref",
+    last_request and last_request.payload.printer_ref == nil)
+check("printer.request carries no tier",
+    last_request and last_request.payload.tier == nil)
+check("printer.request uses api_version 2",
+    last_request and last_request.payload.api_version == 2)
 check("printer.request carried a client_request_id", last_request and type(last_request.payload.client_request_id) == "string")
 check("printer.request used the console destination", last_request and last_request.payload.destination_id == "Printer.Console")
 -- The console packed the per-ONE-item grams as a HASH-KEYED cost_vector
@@ -298,10 +337,6 @@ do
     check("reagent_labels maps the hashed reagent to its display name",
         type(labels) == "table" and labels[single_hash] == "Iron")
 end
-check("printer.request carried the single item name",
-    last_request and last_request.payload.item == "IronBar")
-check("printer.request carried the count (items to print)",
-    last_request and last_request.payload.count == 4)
 
 -- ================== Test 3b: unresolvable recipe is refused, not a crash ==================
 
@@ -336,6 +371,67 @@ check("no printers.request was issued for an un-hashable reagent",
         return true
     end)())
 
+-- ================== Test 3d: a VERIFIED name->item bridge changes the hashed key ==================
+
+print("\n--- Test 3d: a verified ReagentItemMap entry makes the console hash the ITEM name, not the raw catalog key ---")
+-- The single cost_vector key a submit most recently issued (IronBar has one
+-- reagent, so its per-item vector is single-keyed).
+local function last_cost_vector_key()
+    for i = #net_requests, 1, -1 do
+        if net_requests[i].method == "printers.request" then
+            local cv = net_requests[i].payload.cost_vector
+            for k in pairs(cv or {}) do
+                return k
+            end
+        end
+    end
+    return nil
+end
+-- Baseline: with an empty map the console falls back to hashing the RAW catalog
+-- key ('Iron') -- the pre-bridge behaviour every other test relies on.
+mod.state.reagent_item_map = {}
+mod.state.preferences.selected_family = "TestFam"
+mod.state.preferences.selected_recipe = "IronBar"
+mod.state.preferences.selected_quantity = 1
+mod.submit_request()
+local key_raw = last_cost_vector_key()
+check("baseline (no map): a raw-key hash was produced for the 'Iron' reagent",
+    type(key_raw) == "number")
+-- Inject a VERIFIED bridge entry: 'Iron' -> prefab 'ItemIronIngot'.
+mod.state.reagent_item_map = { Iron = { item = "ItemIronIngot", verified = true } }
+mod.submit_request()
+local key_map = last_cost_vector_key()
+check("bridge+verified: a DIFFERENT prefab hash was produced (ItemIronIngot, not 'Iron')",
+    type(key_map) == "number" and key_map ~= key_raw)
+do
+    local last
+    for i = #net_requests, 1, -1 do
+        if net_requests[i].method == "printers.request" then
+            last = net_requests[i]
+            break
+        end
+    end
+    local cv = last and last.payload.cost_vector
+    local labels = last and last.payload.reagent_labels
+    -- The per-item gram amount still passes through, now keyed on the item hash.
+    check("bridge+verified: the 500 grams sit on the item hash",
+        cv and cv[key_map] == 500)
+    -- The human display name stays the reagent's OWN name, never the prefab.
+    check("bridge+verified: reagent_labels keeps the display name ('Iron')",
+        type(labels) == "table" and labels[key_map] == "Iron")
+end
+
+-- ================== Test 3e: an UNVERIFIED map entry falls back to the raw key ==================
+
+print("\n--- Test 3e: an unverified map entry falls back to the raw catalog key (no silent guess) ---")
+mod.state.reagent_item_map = { Iron = { item = "ItemIronIngot", verified = false } }
+mod.submit_request()
+local key_unverified = last_cost_vector_key()
+check("unverified map entry falls back to the raw-key hash (same as the baseline)",
+    key_unverified == key_raw)
+-- Reset to a clean slate so later tests see an empty map.
+mod.state.reagent_item_map = {}
+
 -- ================== Test 4: cancel goes through printers.cancel ==================
 
 print("\n--- Test 4: cancel routes through printers.cancel ---")
@@ -348,15 +444,14 @@ for i = #net_requests, 1, -1 do
     end
 end
 check("a printers.cancel was issued", last_cancel ~= nil)
-check("cancel targeted Printer.Controller", last_cancel and last_cancel.target == "Printer.Controller")
-check("cancel carried request_id", last_cancel and last_cancel.payload.request_id == "task-1")
+check("cancel targeted LuaC.Printer.Controller", last_cancel and last_cancel.target == "LuaC.Printer.Controller")
+check("cancel carried task_id", last_cancel and last_cancel.payload.task_id == "task-1")
 check("cancel carried requester_id", last_cancel and type(last_cancel.payload.requester_id) == "string")
 
 -- ================== Test 5: no storage contact even after many ops ==================
 
 print("\n--- Test 5: full op sequence never contacts storage ---")
 mod.fetch_controller_state()
-mod.fetch_controller_config()
 mod.submit_request()
 mod.cancel_task("task-1")
 check("still no storage contact after the full sequence", not any_storage_contact())

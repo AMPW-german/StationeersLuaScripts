@@ -87,19 +87,18 @@ local export_code = [[
     local _exports = {}
     _exports.state = state
     _exports.reserve_batch = reserve_batch
-    _exports.dispatch_reserved = dispatch_reserved
-    _exports.delivery_ack = delivery_ack
+    _exports.consume_batch = consume_batch
     _exports.release_batch = release_batch
     _exports.query_reservation = query_reservation
     _exports.printers_request = printers_request
-    _exports.printers_request_status = printers_request_status
     _exports.printers_cancel = printers_cancel
     _exports.printers_get_state = printers_get_state
-    _exports.printers_get_config = printers_get_config
     _exports.register_api = register_api
-    _exports.check_commission = check_commission
     _exports.discover_printers = discover_printers
+    _exports.service_one = service_one
     _exports.service_tasks = service_tasks
+    _exports.service_ejection = service_ejection
+    _exports.record_residue = record_residue
     _exports.checkpoint = checkpoint
     _exports.restore_state = restore_state
     return _exports
@@ -148,9 +147,21 @@ bit.extract = bit_extract
 
 ctx.ic = {
     enums = {
-        LogicType = { NUMBER = 1048576, LOGICAL = 2097152, TEXT = 3145728 },
+        LogicType = {
+            NUMBER = 1048576, LOGICAL = 2097152, TEXT = 3145728,
+            RecipeHash = 100, Activate = 101, CompletionRatio = 102,
+            ExportCount = 103, ExportQuantity = 104, ImportQuantity = 105,
+            ImportSlotOccupant = 106, ExportSlotOccupant = 107,
+            Idle = 108, Error = 109, ClearMemory = 110, Flush = 111,
+            Open = 112, Output = 113, Time = 114, PrefabHash = 115,
+            On = 116, Setting = 117, Mode = 118,
+        },
         LogicSlotType = { INPUT = 1, INPUT_OUTPUT = 3, INTERNAL = 4 },
-        SorterInstruction = { SORTER_INSTRUCTION_SORT = 1 },
+        SorterInstruction = {
+            SORTER_INSTRUCTION_SORT = 1,
+            FilterPrefabHashEquals = 2,
+            FilterPrefabHashNotEquals = 7,
+        },
     },
     -- The real chip reads/writes via safe_call + these mocks; no-op-ish.
     read_id = function(ref_id, logic_type)
@@ -189,12 +200,26 @@ ctx.ic = {
         publish = function(name, value)
             table.insert(ctx.net.log, { name = name, value = value })
         end,
-        request = function(name, payload, options)
-            local handler = ctx.handlers[name]
-            if not handler then
-                return nil, "no handler registered: " .. name
+        -- Real signature: ic.net.request(target, method, payload, callback,
+        -- [timeout]). Invokes the callback synchronously; this suite registers
+        -- no storage_handler, so storage-target calls report unreachable.
+        request = function(target, method, payload, callback, timeout)
+            if type(callback) == "function" then
+                local handler = ctx.handlers and ctx.handlers[method]
+                if handler then
+                    callback(true, handler(payload, "test-owner",
+                        { origin = "test" }), nil)
+                else
+                    callback(false, nil,
+                        "no handler registered: " .. tostring(method))
+                end
+                return
             end
-            return handler(payload, "test-owner", options or { origin = "test" })
+            local handler = ctx.handlers and ctx.handlers[method]
+            if not handler then
+                return nil, "no handler registered: " .. tostring(method)
+            end
+            return handler(payload, "test-owner", { origin = "test" })
         end,
     },
     -- The durable store. Persists across run_body() calls (across "restarts").
@@ -202,6 +227,8 @@ ctx.ic = {
     persist = {
         set = function(name, value)
             ctx.store["persist:" .. name] = value
+            -- The real ic.persist.set returns true on success.
+            return true
         end,
         get = function(name, default)
             local value = ctx.store["persist:" .. name]
@@ -213,10 +240,11 @@ ctx.ic = {
             end
             return value
         end,
-        exists = function(name)
+        -- The real ic.persist surface: set/get/has/delete/clear.
+        has = function(name)
             return ctx.store["persist:" .. name] ~= nil
         end,
-        remove = function(name)
+        delete = function(name)
             ctx.store["persist:" .. name] = nil
         end,
     },
@@ -241,6 +269,17 @@ local function run_body()
     env.ic = ctx.ic
     -- The controller serializes via util.json.encode/decode; substitute the codec.
     env.util = { json = json }
+    -- Engine Animator.StringToHash / IC10 HASH() stand-in for RecipeHash writes.
+    env.hash = function(name)
+        if type(name) ~= "string" then
+            return nil
+        end
+        local h = 0
+        for i = 1, #name do
+            h = (h * 31 + string.byte(name, i)) % 2147483647
+        end
+        return h
+    end
     return setfenv(chunk, env)()
 end
 
@@ -319,7 +358,7 @@ do
     local m = new_module()
 
     local created = m.printers_request({
-        api_version = 1,
+        api_version = 2,
         client_request_id = "job-1",
         count = 5,
         item = "IronBar",
@@ -354,7 +393,7 @@ do
     -- The durable snapshot decodes to a complete, valid shape.
     local blob = json.decode(raw)
     ok(blob ~= nil, "P2.7 the durable snapshot decodes")
-    ok(blob.controller_schema_version == 1, "P2.8 the snapshot carries the controller schema version")
+    ok(blob.controller_schema_version == 2, "P2.8 the snapshot carries the controller schema version")
 
     local foundTask = false
     for i = 1, #blob.task_order do
@@ -392,7 +431,7 @@ print("\n[TEST P3] Restart recovers in-flight state without re-reserving")
 do
     local m1 = new_module()
     local created = m1.printers_request({
-        api_version = 1,
+        api_version = 2,
         client_request_id = "job-1",
         count = 5,
         item = "IronBar",
@@ -444,7 +483,7 @@ print("\n[TEST P4] Idempotent replay after a restart does not double-reserve")
 do
     local m1 = new_module()
     local created = m1.printers_request({
-        api_version = 1,
+        api_version = 2,
         client_request_id = "job-1",
         count = 5,
         item = "IronBar",
@@ -458,7 +497,7 @@ do
     -- A client that retries the SAME request after the restart must get the same
     -- task (idempotency map was restored), not a fresh reservation.
     local replay = m2.printers_request({
-        api_version = 1,
+        api_version = 2,
         client_request_id = "job-1",
         count = 5,
         item = "IronBar",
@@ -484,10 +523,8 @@ do
     ctx.handlers = nil
 
     local m5 = new_module()
-    m5.state.native_enabled = true
-    m5.state.native_commissioned = true
     local created = m5.printers_request({
-        api_version = 1,
+        api_version = 2,
         client_request_id = "job-5",
         count = 3,
         item = "IronBar",
@@ -496,7 +533,10 @@ do
     }, OWNER)
     local taskId = created.task_id
 
-    -- Drive the task from queued to active; service_tasks checkpoints at the end.
+    -- Drive the task from queued to active; service_tasks checkpoints at the
+    -- end. Two passes: the first issues the counter clear, the second verifies
+    -- it and completes start_print (the busy binding lands there).
+    m5.service_tasks()
     m5.service_tasks()
     ok(m5.state.tasks[taskId] and m5.state.tasks[taskId].state == "active",
         "P5.1 service_tasks moved the task to active")
@@ -545,7 +585,7 @@ do
     -- boots catalog-free and can serve a fresh request (proof the boot is clean,
     -- not that any catalog revision was adopted).
     local fresh = m6.printers_request({
-        api_version = 1,
+        api_version = 2,
         client_request_id = "fresh-after-bad",
         count = 1,
         item = "IronBar",
@@ -567,7 +607,7 @@ do
 
     local m7 = new_module()
     local created = m7.printers_request({
-        api_version = 1,
+        api_version = 2,
         client_request_id = "job-7",
         count = 5,
         item = "IronBar",
@@ -579,7 +619,7 @@ do
         "P7.1 pre-cancel there is one active reservation ledger entry")
 
     local cancelled = m7.printers_cancel(
-        { task_id = taskId, api_version = 1, owner = OWNER }, OWNER)
+        { task_id = taskId, api_version = 2, owner = OWNER }, OWNER)
     ok(cancelled and cancelled.ok == true, "P7.2 the task was cancelled")
     local ledgerAfterCancel = count_table_values(m7.state.reserved_ledger)
     ok(ledgerAfterCancel == 0,
@@ -606,7 +646,7 @@ do
 
     local m8 = new_module()
     local created = m8.printers_request({
-        api_version = 1,
+        api_version = 2,
         client_request_id = "job-8",
         count = 3,
         item = "IronBar",
@@ -651,6 +691,155 @@ do
     -- The controller aggregated per-item x count on the source chip: 2 x 3 = 6.
     ok(m8.state.reserved[OWNER] == 6,
         "P8.6 the controller-side aggregate is per-item x count = 6 on the owner")
+end
+
+--------------------------------------------
+-- TEST P9: Post-cancel residue survives a restart (durable ledger)
+--------------------------------------------
+print("\n[TEST P9] Post-cancel residue survives a restart")
+
+do
+    ctx.store = {}
+    ctx.handlers = nil
+
+    local m9 = new_module()
+    -- A storage line that accepts every send, so the task's delivered_reagents
+    -- is populated when it is reached (2g x 3 = 6 in flight). The mock
+    -- dispatches net.request by method name, matching the real signature.
+    ctx.handlers["storage.request"] = function(payload, sender)
+        return { api_version = 2, ok = true }
+    end
+    local created = m9.printers_request({
+        api_version = 2,
+        client_request_id = "job-9",
+        count = 3,
+        item = "IronBar",
+        family_id = 1,
+        cost_vector = { [9] = 2 },
+    }, OWNER)
+    local taskId = created.task_id
+
+    -- Reach the task (storage sends, Activate fires), then cancel it mid-run:
+    -- the delivered-but-unconsumed grams become residue.
+    m9.service_tasks()
+    ok(m9.state.tasks[taskId] and m9.state.tasks[taskId].state == "active",
+        "P9.1 the task is active after service")
+    m9.printers_cancel({ task_id = taskId, api_version = 2, owner = OWNER }, OWNER)
+    ok(m9.state.residue[1] and m9.state.residue[1][9] == 6,
+        "P9.2 cancel-active recorded 6 residue grams on family 1")
+    ok(type(ctx.store["persist:" .. PERSISTENCE_KEY]) == "string",
+        "P9.3 the residue was checkpointed to ic.persist")
+
+    -- Restart: the residue ledger restores so the ejection pass can resume.
+    local m9b = new_module()
+    ok(m9b.state.residue[1] and m9b.state.residue[1][9] == 6,
+        "P9.4 the residue ledger survived the restart (normalized numeric keys)")
+    ok(m9b.state.tasks[taskId] and m9b.state.tasks[taskId].state == "cancelled",
+        "P9.5 the cancelled task survived the restart")
+
+    -- With no live family work the ejection pass starts on the recovered chip.
+    m9b.service_ejection()
+    ok(m9b.state.ejecting[1] ~= nil,
+        "P9.6 the recovered chip begins ejection for the restored residue")
+end
+
+--------------------------------------------
+-- TEST P10: Oversize snapshot chunks across persist keys
+--------------------------------------------
+-- ic.persist caps one VALUE at 8192B but the whole store gets ~32KB: a
+-- snapshot that outgrows a single value now splits over "<key>:N" siblings
+-- under a manifest in the base key, at FULL fidelity. Only past the ~31KB
+-- total budget does the staged degradation engage -- and a rejected write
+-- still fails loudly instead of freezing the recovery point (the bug that
+-- kept reviving a cancelled task).
+print("\n[TEST P10] Oversize snapshot chunks + degrades past the total budget")
+
+do
+    ctx.store = {}
+    ctx.handlers = nil
+
+    local m10 = new_module()
+    local created = m10.printers_request({
+        api_version = 2,
+        client_request_id = "job-10",
+        count = 2,
+        item = "IronBar",
+        family_id = 1,
+        cost_vector = { [9] = 2 },
+    }, OWNER)
+    local taskId = created.task_id
+
+    -- ~14KB of journal: over one value's cap but under the chunked budget, so
+    -- the snapshot splits at FULL fidelity -- no degradation at all.
+    for i = 1, 100 do
+        m10.state.journal[#m10.state.journal + 1] = {
+            seq = i, op = "filler", task_id = taskId, tick = i,
+            detail = string.rep("x", 120),
+        }
+    end
+    ok(m10.checkpoint() == true,
+        "P10.1 the checkpoint writes past the per-value limit")
+    local raw = ctx.store["persist:" .. PERSISTENCE_KEY]
+    local manifest = type(raw) == "string" and json.decode(raw) or nil
+    local chunks = type(manifest) == "table" and manifest.snapshot_chunks or 0
+    ok(chunks >= 2,
+        "P10.2 the base key holds a chunk manifest (" .. chunks .. " chunks)")
+    local total, parts = 0, {}
+    for i = 1, chunks do
+        local piece = ctx.store["persist:" .. PERSISTENCE_KEY .. ":" .. i]
+        ok(type(piece) == "string" and #piece <= 7800,
+            "P10.2 chunk " .. i .. " fits one persist value")
+        parts[#parts + 1] = piece
+        if type(piece) == "string" then total = total + #piece end
+    end
+    ok(total <= 31200,
+        "P10.2 the chunked payload fits the total budget (" .. total .. "B)")
+    ok(m10.state.persist_degraded == nil,
+        "P10.3 full fidelity is kept -- no degradation inside the budget")
+    local blob = json.decode(table.concat(parts))
+    ok(type(blob) == "table" and type(blob.tasks) == "table",
+        "P10.3 reassembled chunks decode to the snapshot")
+
+    -- Live tasks, the ledger, and the idempotency key survive a restart that
+    -- restores through the chunked layout.
+    local m10b = new_module()
+    ok(m10b.state.tasks[taskId] and m10b.state.tasks[taskId].state == "queued",
+        "P10.4 the live task survives a chunked snapshot restart")
+    ok(m10b.state.idempotency[OWNER .. ":job-10"] == taskId,
+        "P10.4 the idempotency key survives for the live task")
+    ok(next(m10b.state.reserved_ledger) ~= nil,
+        "P10.4 the reservation ledger survives the chunks")
+
+    -- The reported failure shape: a cancel issued while the snapshot is over
+    -- the single-value limit must still land durably.
+    m10b.state.journal = {}
+    local c = m10b.printers_cancel(
+        { task_id = taskId, api_version = 2, owner = OWNER }, OWNER)
+    ok(c and c.ok == true, "P10.5 the cancel succeeds")
+    ok(ctx.store["persist:" .. PERSISTENCE_KEY .. ":2"] == nil,
+        "P10.5 stale chunk keys are swept on the small-snapshot write")
+    local m10c = new_module()
+    ok(m10c.state.tasks[taskId] and m10c.state.tasks[taskId].state == "cancelled",
+        "P10.5 the cancelled task survives the restart (no resurrection)")
+
+    -- Re-cancelling a cancelled task is idempotent, not an error.
+    local re = m10c.printers_cancel(
+        { task_id = taskId, api_version = 2, owner = OWNER }, OWNER)
+    ok(re and re.ok == true and re.already_cancelled == true,
+        "P10.6 re-cancelling a cancelled task reports ok")
+
+    -- Past the TOTAL chunked budget the staged degradation still engages and
+    -- still lands the live state.
+    for i = 1, 400 do
+        m10c.state.journal[#m10c.state.journal + 1] = {
+            seq = i, op = "filler", task_id = taskId, tick = i,
+            detail = string.rep("x", 120),
+        }
+    end
+    ok(m10c.checkpoint() == true,
+        "P10.7 the checkpoint still writes past the total budget")
+    ok(m10c.state.persist_degraded ~= nil,
+        "P10.7 degradation is reported past the chunked budget")
 end
 
 --------------------------------------------

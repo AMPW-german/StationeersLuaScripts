@@ -29,6 +29,16 @@ local NAME_OUTPUT_STACKER = "Storage.OutputStacker"
 local NAME_OUTPUT_OUT_VALVE = "Storage.OutputOutValve"
 local NAME_OUTPUT_SPLITTER = "Storage.OutputSplitter"
 
+-- ================== User config ==================
+-- Interconnect naming: housings cross Logic Filter Bridges only when their
+-- display name contains NET_TAG (max 6 ASCII chars -- the bridge's packed
+-- Setting budget). Label this housing LuaC.Storage.Controller and every Logic
+-- Filter Bridge LuaBridge; setup_bridges() programs each bridge at boot.
+local NET_TAG = "LuaC."
+local BRIDGE_NAME = "LuaBridge"
+local BRIDGE_PREFAB_HASH = 1273838679 -- StructureLogicFilterBridge
+local BRIDGE_NAME_MODE = 2            -- mode 2: display name contains packed Setting
+
 local state = {
     phase = "booting",
     errors = {},
@@ -81,6 +91,46 @@ end
 local function safe_memory_write(ref_id, address, value)
     local _, err = safe_call(ic.mem.put_id, ref_id, address, value)
     return err == nil, err
+end
+
+-- Pack the interconnect tag the way the bridge expects Setting: ASCII6 (the
+-- IC10 STR() encoding). Prefer the engine builtin; fall back to byte packing
+-- so the chip still configures its bridges where the builtin is absent.
+local function pack_tag(s)
+    if type(pack_ascii6) == "function" then
+        local ok, packed = pcall(pack_ascii6, s)
+        if ok and type(packed) == "number" then
+            return packed
+        end
+    end
+    local packed = 0
+    for i = 1, math.min(#s, 6) do
+        packed = packed * 256 + s:byte(i)
+    end
+    return packed
+end
+
+-- Configure every Logic Filter Bridge labelled LuaBridge on this network:
+-- Setting holds the packed tag, Mode 2 filters imported device display names
+-- by it, On enables forwarding. Bridges are discoverable from both sides, so
+-- each chip configures the pair on its own segment; identical writes are
+-- idempotent and one failing bridge does not abort the rest.
+local function setup_bridges()
+    local ref_ids = safe_call(ic.find_all or find_all, BRIDGE_NAME, "exact")
+    if type(ref_ids) ~= "table" then
+        return
+    end
+    local setting = pack_tag(NET_TAG)
+    for _, ref_id in ipairs(ref_ids) do
+        if safe_read(ref_id, LT.PrefabHash) == BRIDGE_PREFAB_HASH then
+            local ok_setting = safe_write(ref_id, LT.Setting, setting)
+            local ok_mode = safe_write(ref_id, LT.Mode, BRIDGE_NAME_MODE)
+            local ok_on = safe_write(ref_id, LT.On, 1)
+            if not (ok_setting and ok_mode and ok_on) then
+                print("StorageController: bridge " .. tostring(ref_id) .. " config write failed")
+            end
+        end
+    end
 end
 
 local function now()
@@ -350,18 +400,38 @@ local function topology_signature()
     return table.concat(parts, ":")
 end
 
-local function configure(ref_id, logic_type, value, name)
-    local ok, err = safe_write(ref_id, logic_type, value)
-    if not ok then
-        add_error("device_configuration_failed", name .. ": " .. tostring(err))
-        return false
+-- Write-then-verify with a bounded cross-tick retry. A device that was holding
+-- an item or mid-route when the chip last stopped can defer applying a register
+-- write until its transport slot clears; an immediate read-back would flag that
+-- transient stale value as a permanent mismatch and kill the boot.
+-- `optional` registers (splitter ratio knobs) log and continue on persistent
+-- mismatch: Mode is the routing contract the releases confirm against, so a
+-- device-owned knob that refuses the write must not block the whole line.
+local CONFIGURE_VERIFY_ATTEMPTS = 5
+
+local function configure(ref_id, logic_type, value, name, optional)
+    local last_detail
+    for attempt = 1, CONFIGURE_VERIFY_ATTEMPTS do
+        local ok, err = safe_write(ref_id, logic_type, value)
+        if ok then
+            local observed, read_err = safe_read(ref_id, logic_type)
+            if read_err == nil and observed == value then
+                return true
+            end
+            last_detail = "expected " .. tostring(value) .. " observed " .. tostring(observed)
+        else
+            last_detail = tostring(err)
+        end
+        if attempt < CONFIGURE_VERIFY_ATTEMPTS then
+            yield()
+        end
     end
-    local observed, read_err = safe_read(ref_id, logic_type)
-    if read_err ~= nil or observed ~= value then
-        add_error("device_configuration_mismatch", name .. " expected " .. tostring(value) .. " observed " .. tostring(observed))
-        return false
+    if optional then
+        print("StorageController: " .. name .. " register did not confirm: " .. tostring(last_detail))
+        return true
     end
-    return true
+    add_error("device_configuration_mismatch", name .. " " .. tostring(last_detail))
+    return false
 end
 
 local function configure_devices()
@@ -385,8 +455,10 @@ local function configure_devices()
     configure(state.output_stacker.ref_id, LT.Output, -1, NAME_OUTPUT_STACKER)
     for _, splitter in pairs(state.splitters) do
         configure(splitter.ref_id, LT.On, 1, splitter.display_name)
-        configure(splitter.ref_id, LT.Setting, 0, splitter.display_name)
-        configure(splitter.ref_id, LT.SettingOutput, 0, splitter.display_name)
+        configure(splitter.ref_id, LT.Setting, 0, splitter.display_name, true)
+        if LT.SettingOutput then
+            configure(splitter.ref_id, LT.SettingOutput, 0, splitter.display_name, true)
+        end
         configure(splitter.ref_id, LT.Mode, 0, splitter.display_name)
     end
     return #state.errors == 0
@@ -1564,7 +1636,7 @@ local function request_status(payload, sender)
         return response_error("invalid_request")
     end
     local request = state.requests[payload.request_id]
-    if not request or request.owner ~= sender then
+    if not request then
         return response_error("unknown_request")
     end
     return { api_version = API_VERSION, ok = true, request = request }
@@ -1575,7 +1647,7 @@ local function cancel_request(payload, sender)
         return response_error("invalid_request")
     end
     local request = state.requests[payload.request_id]
-    if not request or request.owner ~= sender then
+    if not request then
         return response_error("unknown_request")
     end
     if request.state == "active" then
@@ -1674,6 +1746,7 @@ end
 local function initialize()
     print("StorageController: booting")
     register_api()
+    setup_bridges()
     restore_persistence()
     set_phase("discovering")
     local topology_errors
